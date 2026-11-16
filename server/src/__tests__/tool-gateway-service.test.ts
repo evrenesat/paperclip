@@ -1201,6 +1201,49 @@ describeEmbeddedPostgres("tool gateway service", () => {
     expect((result.result as { result?: { data?: { target?: string } } }).result?.data?.target).toBe("repo");
   });
 
+  it("approves the paired formal approval when a human accepts the tool review card (#17706)", async () => {
+    const { company, agent, run } = await createRunFixture(db);
+    await db.insert(toolPolicies).values({
+      companyId: company.id,
+      name: "Review destructive tools",
+      policyType: "require_approval",
+      selectors: { toolName: "fixture:delete_everything" },
+    });
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: fakePluginDispatcher() });
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    await expect(gateway.executeTool({
+      sessionToken: session.token,
+      tool: "fixture:delete_everything",
+      parameters: { target: "repo" },
+    })).rejects.toMatchObject({ reasonCode: "approval_required" });
+    const [actionRequest] = await db.select().from(toolActionRequests);
+    const cardInput = {
+      companyId: company.id,
+      issueId: session.issueId!,
+      interactionId: actionRequest.interactionId!,
+      actionRequestId: actionRequest.id,
+    };
+
+    await expect(gateway.approveActionRequest({ ...cardInput, actor: { agentId: agent.id } }))
+      .rejects.toMatchObject({ reasonCode: "human_review_required" });
+
+    const [original] = await db.select().from(approvals).where(eq(approvals.id, actionRequest.approvalId!));
+    await db.update(approvals).set({
+      payload: { ...(original.payload as Record<string, unknown>), argumentsHash: "not-the-reviewed-hash" },
+    }).where(eq(approvals.id, original.id));
+    await expect(gateway.approveActionRequest({ ...cardInput, actor: { userId: "board-user" } }))
+      .rejects.toMatchObject({ reasonCode: "formal_approval_required" });
+    const [stillPending] = await db.select().from(approvals).where(eq(approvals.id, original.id));
+    expect(stillPending.status).toBe("pending");
+    await db.update(approvals).set({ payload: original.payload }).where(eq(approvals.id, original.id));
+
+    await gateway.approveActionRequest({ ...cardInput, actor: { userId: "board-user" } });
+    const [formal] = await db.select().from(approvals).where(eq(approvals.id, original.id));
+    expect(formal).toMatchObject({ status: "approved", decidedByUserId: "board-user" });
+    const [settled] = await db.select().from(toolActionRequests).where(eq(toolActionRequests.id, actionRequest.id));
+    expect(settled.status).not.toBe("pending");
+  });
+
   it("maps remote MCP elicitation to a durable issue interaction", async () => {
     const { company, agent, run } = await createRunFixture(db);
     await createRemoteMcpToolFixture(db, company.id);
