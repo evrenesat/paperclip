@@ -171,6 +171,7 @@ import type {
   PluginToolDispatcher,
 } from "./plugin-tool-dispatcher.js";
 import { logActivity, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
+import { approvalResolutionRecords } from "../lib/approval-records.js";
 import { secretService } from "./secrets.js";
 import { connectionGrantCredentialRef, resolveConnectionGrantSecret } from "./connection-credentials.js";
 import { railwayCommandBudgetMs, createRailwayClient, isRailwayConnection, isRailwayEndpoint, isRailwayToolBlocked, normalizeRailwayToolName, RAILWAY_API_URL, RAILWAY_TOOL_PREFIX, RailwayError } from "./railway.js";
@@ -486,6 +487,23 @@ export function deduplicateToolDescriptors(tools: readonly ToolGatewayDescriptor
     unique.set(tool.name, tool);
   }
   return [...unique.values()];
+}
+
+/** The formal approval was minted by the gateway for exactly this review. */
+export function formalApprovalMatchesToolAction(
+  payload: unknown,
+  expected: { actionRequestId: string; invocationId: string; argumentsHash: string | null },
+): boolean {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
+  const record = payload as Record<string, unknown>;
+  return (
+    record.source === "tool_gateway" &&
+    record.actionRequestId === expected.actionRequestId &&
+    record.invocationId === expected.invocationId &&
+    typeof record.argumentsHash === "string" &&
+    record.argumentsHash.length > 0 &&
+    record.argumentsHash === (expected.argumentsHash ?? "")
+  );
 }
 
 interface ExecuteGatewayToolInput {
@@ -12405,8 +12423,8 @@ export function createToolGatewayService(
         );
       }
       if (actionRequest.approvalId) {
-        const [formalApproval] = await db
-          .select({ status: approvals.status })
+        let [formalApproval] = await db
+          .select({ status: approvals.status, payload: approvals.payload })
           .from(approvals)
           .where(
             and(
@@ -12415,6 +12433,53 @@ export function createToolGatewayService(
             ),
           )
           .limit(1);
+        // EVR fork (paperclipai/paperclip#17706): a human accepting the
+        // tool-review card from the task thread is the board decision for the
+        // paired formal approval. Approve it here so one click runs the
+        // action, but only when the approval was minted by the gateway for
+        // this exact request and reviewed arguments.
+        if (
+          formalApproval &&
+          actionRequest.status === "pending" &&
+          !(actionRequest.expiresAt && actionRequest.expiresAt <= new Date()) &&
+          input.interactionId &&
+          input.actor.userId &&
+          !input.actor.agentId &&
+          (formalApproval.status === "pending" ||
+            formalApproval.status === "revision_requested") &&
+          formalApprovalMatchesToolAction(formalApproval.payload, {
+            actionRequestId: actionRequest.id,
+            invocationId: invocation.id,
+            argumentsHash: actionRequest.canonicalArgumentsHash,
+          })
+        ) {
+          const { approval: resolved, applied } =
+            await approvalResolutionRecords(db).resolveApproval(
+              actionRequest.approvalId,
+              "approved",
+              input.actor.userId,
+              "Approved from the tool review card in the task thread.",
+            );
+          if (applied) {
+            await logActivity(db, {
+              companyId: input.companyId,
+              actorType: "user",
+              actorId: input.actor.userId,
+              action: "approval.approved",
+              entityType: "approval",
+              entityId: resolved.id,
+              issueId: input.issueId,
+              details: {
+                type: resolved.type,
+                requestedByAgentId: resolved.requestedByAgentId,
+                source: "tool_review_card",
+                actionRequestId: actionRequest.id,
+                interactionId: input.interactionId,
+              },
+            });
+          }
+          formalApproval = { status: resolved.status, payload: resolved.payload };
+        }
         if (!formalApproval || formalApproval.status !== "approved") {
           throw new ToolGatewayHttpError(
             409,
