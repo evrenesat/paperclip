@@ -29,6 +29,7 @@ import { googleWorkspaceToolTarget, googleWorkspaceGrantedScopes, isGoogleWorksp
 import { isInsufficientConnectionScope, INSUFFICIENT_CONNECTION_SCOPE_MESSAGE } from "./connection-permission-errors.js";
 import { githubAccessDeniedInstructions, githubAccessError } from "./tool-access/github-access-errors.js";
 import { githubDefaultOwnerApplies, githubDefaultOwnerArguments } from "./tool-access/github-default-owner.js";
+import { reviewAutoApproval, toolFloorMatches, type ReviewedToolAccessDecision } from "./tool-access/auto-approval.js";
 import { toolSourceTemplateKeySql } from "./tool-access/source-template-key.js";
 import { usesClientCredentials } from "./tool-access/oauth/client-credentials.js";
 import { boundedMcpToolName } from "./mcp-tool-names.js";
@@ -1090,10 +1091,6 @@ export function shortStableId(id: string): string {
   return id.replace(/-/g, "").slice(0, 8);
 }
 
-function toolRequiresFormalApproval(tool: ToolGatewayDescriptor): boolean {
-  return tool.risk === "destructive";
-}
-
 function toolAuditMetadata(
   tool: ToolGatewayDescriptor,
 ): Record<string, unknown> {
@@ -1533,7 +1530,7 @@ export function createToolGatewayService(
     await connectionManagementService(database).authorize(actor, "connections:gateway", resource, { mutation: false });
     await connectionManagementService(database).authorize(actor, "connections:test", resource, { mutation: false });
   }
-  async function recordToolInvocation(input: ToolAccessDecisionInput, decision: ToolAccessDecision) {
+  async function recordToolInvocation(input: ToolAccessDecisionInput, decision: ReviewedToolAccessDecision) {
     try {
       return await policyService.recordInvocation(input, decision);
     } catch (error) {
@@ -2872,7 +2869,15 @@ export function createToolGatewayService(
       });
 
     let formalApprovalId: string | null = null;
-    if (toolRequiresFormalApproval(input.tool)) {
+    const floorMatches = await toolFloorMatches(db, {
+      toolName: input.tool.name,
+      upstreamToolName: input.tool.upstreamToolName ?? null,
+      providerType: input.tool.providerType ?? null,
+      riskLevel: input.tool.risk ?? null,
+      parameters: input.parameters,
+      sessionCompanyId: input.session.companyId,
+    });
+    if (floorMatches.length > 0) {
       const [approval] = await writeApprovalChange(db, input.session.companyId, tx => tx
         .insert(approvals)
         .values({
@@ -2881,7 +2886,7 @@ export function createToolGatewayService(
           requestedByAgentId: input.session.originatingAgentId ?? input.session.agentId,
           payload: {
             title: `Approve high-risk tool action: ${input.tool.name}`,
-            summary: `${input.tool.name} is classified as ${input.tool.risk} and requires formal board approval before execution.`,
+            summary: `${input.tool.name} hit the hard approval floor (${floorMatches.map((match) => match.floorClass).join(", ")}) and requires formal board approval before execution.`,
             recommendedAction:
               "Approve only if the reviewed arguments match the intended operation.",
             risks: [
@@ -11839,11 +11844,11 @@ export function createToolGatewayService(
       const chosenDecision = callerDecision && !callerDecision.allowed && callerDecision.decision !== "require_approval" ? callerDecision
         : !targetDecision.allowed ? targetDecision
           : callerDecision?.decision === "require_approval" ? callerDecision : targetDecision;
-      const accessDecision = { ...chosenDecision, policyExplanation: {
+      const accessDecision = await reviewAutoApproval(db, decisionInput, { ...chosenDecision, policyExplanation: {
         ...chosenDecision.policyExplanation,
         consumedRateAdmissions: targetDecision.policyExplanation?.consumedRateAdmissions,
         delegatedCallerConsumedRateAdmissions: callerDecision?.policyExplanation?.consumedRateAdmissions,
-      } };
+      } });
       if (callerDecisionInput && callerDecision) await policyService.writeAudit(callerDecisionInput, callerDecision);
       if (accessDecision.allowed || accessDecision.decision === "require_approval") await assertDelegatedTestCredentialAccess(session, tool);
       const recorded = await recordToolInvocation(
@@ -13260,9 +13265,11 @@ export function createToolGatewayService(
         if (accessDecision.allowed && tool.providerType === "paperclip_slack_chat" && SLACK_TOOLS.some(t => t.name === tool.upstreamToolName && t.risk === "approval")) {
           accessDecision = { ...accessDecision, allowed: false, decision: "require_approval", reasonCode: "requires_approval_policy", explanation: "Slack destructive actions, channel creation and invitations require approval." };
         }
+        const reviewedDecision = await reviewAutoApproval(db, decisionInput, accessDecision);
+        accessDecision = reviewedDecision;
         const recorded = await recordToolInvocation(
           decisionInput,
-          accessDecision,
+          reviewedDecision,
         );
         await policyService.writeAudit(decisionInput, accessDecision);
         invocationId = recorded.invocation.id;
@@ -13828,7 +13835,7 @@ export function createToolGatewayService(
         parameters: requestedParameters,
         consumeRateLimit: true,
       });
-      const accessDecision = await policyService.decide(decisionInput);
+      const accessDecision = await reviewAutoApproval(db, decisionInput, await policyService.decide(decisionInput));
       const recorded = await recordToolInvocation(
         decisionInput,
         accessDecision,

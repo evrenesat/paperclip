@@ -789,6 +789,8 @@ async function createRemoteToolFixture(
   input: {
     riskLevel?: "read" | "write" | "destructive";
     quarantined?: boolean;
+    toolName?: string;
+    title?: string;
   } = {},
 ) {
   const [application] = await db
@@ -826,6 +828,7 @@ async function createRemoteToolFixture(
     isDefault: true,
   });
   const riskLevel = input.riskLevel ?? "write";
+  const fixtureToolName = input.toolName ?? "send_email";
   const [catalogEntry] = await db
     .insert(toolCatalogEntries)
     .values({
@@ -833,9 +836,9 @@ async function createRemoteToolFixture(
       applicationId: application!.id,
       connectionId: connection!.id,
       entryKind: "tool",
-      name: `send_email-${randomUUID()}`,
-      toolName: "send_email",
-      title: "Send email",
+      name: `${fixtureToolName}-${randomUUID()}`,
+      toolName: fixtureToolName,
+      title: input.title ?? "Send email",
       description: "Send a fixture email.",
       inputSchema: {
         type: "object",
@@ -4115,7 +4118,7 @@ describeEmbeddedPostgres("tool access service", () => {
     const userId = `tool-tester-${randomUUID()}`;
     await grantBoardUser(db, company.id, userId, ["tools:use"]);
     const agent = await createAgent(db, company.id);
-    const { connection } = await createRemoteToolFixture(db, company.id);
+    const { connection } = await createRemoteToolFixture(db, company.id, { toolName: "create_ticket", title: "Create ticket" });
     await db.insert(toolPolicies).values({
       companyId: company.id,
       name: `Allow test call ${randomUUID()}`,
@@ -4140,7 +4143,7 @@ describeEmbeddedPostgres("tool access service", () => {
       .post(`/api/tool-connections/${connection.id}/test-calls`)
       .send({
         agentId: agent.id,
-        toolName: "send_email",
+        toolName: "create_ticket",
         parameters: { to: "a@example.com", body: "hi" },
       })
       .expect(200);
