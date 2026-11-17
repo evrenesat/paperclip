@@ -99,6 +99,62 @@ describePostgres("sidebar badge failure candidates", () => {
     await verify({ ...fixture.options, currentUserId });
   });
 
+  it("drops failures whose task settled and keeps the still-open one", async () => {
+    const [runRows, issueRows] = await Promise.all([
+      db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, issueId: heartbeatRuns.issueId, status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId)),
+      db.select({ id: issues.id, title: issues.title, status: issues.status }).from(issues).where(eq(issues.companyId, fixture.companyId)),
+    ]);
+    const titleByIssue = new Map(issueRows.map(row => [row.id, row.title]));
+    const agentIdsByTitle = new Map<string, Set<string>>();
+    for (const row of runRows) {
+      if (!row.issueId) continue;
+      const title = titleByIssue.get(row.issueId);
+      if (!title) continue;
+      if (!agentIdsByTitle.has(title)) agentIdsByTitle.set(title, new Set());
+      agentIdsByTitle.get(title)!.add(row.agentId);
+    }
+    const service = sidebarBadgeService(db);
+    const options = { currentUserId: "user-1" as string | null, dismissals: new Map<string, number>() };
+    const base = await service.get(fixture.companyId, options);
+    // Dismiss every still-open failure and the rest of the count must be the
+    // settled failures that the badge already dropped.
+    const openAgentIds = agentIdsByTitle.get("Still blocked") ?? new Set();
+    const openRunRows = runRows.filter(row => openAgentIds.has(row.agentId) && row.status === "failed");
+    const withoutOpen = await service.get(fixture.companyId, {
+      ...options,
+      dismissals: new Map(openRunRows.map(row => [`run:${row.id}`, (row.createdAt as Date).getTime()])),
+    });
+    // The blocked task's failure survives; the done, cancelled and
+    // later-run-replaced failures never reach the count.
+    expect(base.failedRuns).toBeGreaterThanOrEqual(openRunRows.length);
+    expect(withoutOpen.failedRuns).toBe(base.failedRuns - openRunRows.length);
+  });
+
+  it("hides a failed run the Inbox dismissed under either dismissal key", async () => {
+    const [runRows, issueRows] = await Promise.all([
+      db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, issueId: heartbeatRuns.issueId, status: heartbeatRuns.status, createdAt: heartbeatRuns.createdAt })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.companyId, fixture.companyId)),
+      db.select({ id: issues.id, title: issues.title }).from(issues).where(eq(issues.companyId, fixture.companyId)),
+    ]);
+    const titleByIssue = new Map(issueRows.map(row => [row.id, row.title]));
+    const candidate = runRows.find(row => row.status === "failed" && row.issueId
+      && titleByIssue.get(row.issueId) === "Still blocked");
+    expect(candidate).toBeDefined();
+    const service = sidebarBadgeService(db);
+    const options = { currentUserId: "user-1" as string | null };
+    const base = await service.get(fixture.companyId, options);
+    const dismissedAt = (candidate!.createdAt as Date).getTime();
+    // The Decisions close endpoint writes the attention:run:{id} spelling.
+    const withAttentionKey = await service.get(fixture.companyId,
+      { ...options, dismissals: new Map([[`attention:run:${candidate!.id}`, dismissedAt]]) });
+    expect(withAttentionKey.failedRuns).toBe(base.failedRuns - 1);
+    // The Inbox writes the bare run:{id} spelling; both must hide the card.
+    const withBareKey = await service.get(fixture.companyId,
+      { ...options, dismissals: new Map([[`run:${candidate!.id}`, dismissedAt]]) });
+    expect(withBareKey.failedRuns).toBe(base.failedRuns - 1);
+  });
+
   it("retains company-wide behavior without an actor or options", async () => {
     await verify();
     await verify({ ...fixture.options, actor: undefined });

@@ -318,6 +318,35 @@ describe("inbox helpers", () => {
     ).toBe(false);
   });
 
+  it("accepts the Decisions dismissal spelling of an Inbox entity key", () => {
+    const dismissedAtByKey = buildInboxDismissedAtByKey([
+      {
+        id: "dismissal-attention",
+        companyId: "company-1",
+        userId: "user-1",
+        itemKey: "attention:run:run-1",
+        kind: "dismiss",
+        dismissedAt: new Date("2026-03-11T01:00:00.000Z"),
+        snoozedUntil: null,
+        fingerprint: null,
+        createdAt: new Date("2026-03-11T01:00:00.000Z"),
+        updatedAt: new Date("2026-03-11T01:00:00.000Z"),
+      },
+    ]);
+
+    // The Inbox reads `run:{id}`; the Decisions close endpoint wrote
+    // `attention:run:{id}`. Either spelling hides the card.
+    expect(
+      isInboxEntityDismissed(dismissedAtByKey, "run:run-1", new Date("2026-03-11T00:30:00.000Z")),
+    ).toBe(true);
+    expect(
+      isInboxEntityDismissed(dismissedAtByKey, "run:run-1", new Date("2026-03-11T01:30:00.000Z")),
+    ).toBe(false);
+    expect(
+      isInboxEntityDismissed(dismissedAtByKey, "attention:run:run-1", new Date("2026-03-11T00:30:00.000Z")),
+    ).toBe(true);
+  });
+
   it("keeps read issues in the touched list but excludes them from unread counts", () => {
     const issues = [makeIssue("1", true), makeIssue("2", false)];
 

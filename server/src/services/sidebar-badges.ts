@@ -1,6 +1,6 @@
 import { and, desc, eq, inArray, isNull, not, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, approvals, heartbeatRuns } from "@paperclipai/db";
+import { agents, approvals, heartbeatRuns, issues } from "@paperclipai/db";
 import type { SidebarBadges } from "@paperclipai/shared";
 import { authorizationService, type AuthorizationActor } from "./authorization.js";
 import { getHeartbeatRunReadDecisions } from "./heartbeat-run-privacy.js";
@@ -13,14 +13,52 @@ function normalizeTimestamp(value: Date | string | null | undefined): number {
   return Number.isFinite(timestamp) ? timestamp : 0;
 }
 
+/**
+ * Dismissals are written under two spellings: the Inbox writes the entity key
+ * (`run:{id}`) and the Decisions close endpoint writes the attention card key
+ * (`attention:run:{id}`). Hiding a failed run, approval or join request must
+ * work from either surface, so every lookup tries both spellings.
+ */
+export function dismissalVariants(itemKey: string): string[] {
+  return itemKey.startsWith("attention:")
+    ? [itemKey, itemKey.slice("attention:".length)]
+    : [itemKey, `attention:${itemKey}`];
+}
+
 function isDismissed(
   dismissedAtByKey: ReadonlyMap<string, number>,
   itemKey: string,
   activityAt: Date | string | null | undefined,
 ) {
-  const dismissedAt = dismissedAtByKey.get(itemKey);
-  if (dismissedAt == null) return false;
-  return dismissedAt >= normalizeTimestamp(activityAt);
+  return dismissalVariants(itemKey).some((key) => {
+    const dismissedAt = dismissedAtByKey.get(key);
+    if (dismissedAt == null) return false;
+    return dismissedAt >= normalizeTimestamp(activityAt);
+  });
+}
+
+/**
+ * A failed run leaves the badge with its card: the Inbox Mine page hides a
+ * failure card once the task moved on (done or cancelled, or a later run
+ * replaced the failure), so the badge counts only failures that can still be
+ * opened. Without this, recovered tasks keep a badge number with no entry.
+ * `${candidateCompany}`, `${candidateCreatedAt}` and `${candidateIssueId}`
+ * must be the candidate row's own columns (the `ranked_runs` CTE).
+ */
+function settledIssueCondition(candidateCompany: SQL, candidateCreatedAt: SQL, candidateIssueId: SQL) {
+  return sql<boolean>`(
+    exists (
+      select 1 from ${issues}
+      where ${issues.id} = ${candidateIssueId}::uuid
+        and ${issues.companyId} = ${candidateCompany}
+        and ${issues.status} in ('done', 'cancelled')
+    ) or exists (
+      select 1 from ${heartbeatRuns} later_run
+      where later_run.company_id = ${candidateCompany}
+        and later_run.created_at > ${candidateCreatedAt}
+        and later_run.issue_id = ${candidateIssueId}::uuid
+    )
+  )`;
 }
 
 export function sidebarBadgeService(db: Db) {
@@ -54,6 +92,7 @@ export function sidebarBadgeService(db: Db) {
       const recentRuns = db
         .select({
           id: heartbeatRuns.id,
+          companyId: heartbeatRuns.companyId,
           agentId: heartbeatRuns.agentId,
           scopeKind: heartbeatRuns.scopeKind,
           issueId: heartbeatRuns.issueId,
@@ -76,6 +115,7 @@ export function sidebarBadgeService(db: Db) {
 
       const observedRuns = db.select({
         id: recentRuns.id,
+        companyId: recentRuns.companyId,
         agentId: recentRuns.agentId,
         scopeKind: recentRuns.scopeKind,
         issueId: recentRuns.issueId,
@@ -86,6 +126,7 @@ export function sidebarBadgeService(db: Db) {
       }).from(recentRuns).as("observed_runs");
       const rankedRuns = db.select({
         id: observedRuns.id,
+        companyId: observedRuns.companyId,
         scopeKind: observedRuns.scopeKind,
         issueId: observedRuns.issueId,
         status: observedRuns.status,
@@ -109,6 +150,11 @@ export function sidebarBadgeService(db: Db) {
         eq(rankedRuns.agentRunRank, 1),
         inArray(rankedRuns.status, ["failed", "timed_out"]),
         mineCondition,
+        // A task the failure no longer represents (done, cancelled, or replaced
+        // by a later run) hides its card in the Inbox; it must not hold a badge.
+        sql<boolean>`(${rankedRuns.issueId}::text is null or not ${settledIssueCondition(
+          sql`${rankedRuns.companyId}`, sql`${rankedRuns.createdAt}`, sql`${rankedRuns.issueId}`,
+        )})`,
       ));
       const failures = candidates.filter((row) =>
         !isDismissed(extra?.dismissals ?? new Map(), `run:${row.id}`, row.createdAt),

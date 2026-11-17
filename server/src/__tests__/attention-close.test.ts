@@ -13,6 +13,7 @@ import {
   companyMemberships,
   createDb,
   decisions,
+  heartbeatRunEvents,
   heartbeatRuns,
   inboxDismissals,
   issueThreadInteractions,
@@ -217,6 +218,39 @@ describeEmbeddedPostgres("attention close, transfer and approval cancel (PAP-749
     expect((await svc.list(companyId, { userId: SCOTT, actor })).items).toEqual([]);
     expect(await svc.summary(companyId, { userId: SCOTT, actor })).toMatchObject({ totalCount: 0, deskBadgeCount: 0, viewCounts: { mine: 0, archived: 3 } });
     expect(await svc.taskIndex(companyId, { userId: SCOTT, actor })).toMatchObject({ totalCount: 0, taskIds: [] });
+  });
+
+  it("hides a failed-run card dismissed by the Inbox under the bare entity key", async () => {
+    const { companyId, workerId } = await seedCompany("BKY");
+    const svc = attentionService(db);
+    const actor = board(companyId, SCOTT) as never;
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: workerId, status: "failed", responsibleUserId: SCOTT,
+      error: "Bounded retry exhausted", errorCode: "retries_exhausted", createdAt: new Date(), updatedAt: new Date(),
+    });
+    await db.insert(heartbeatRunEvents).values({
+      companyId, runId, agentId: workerId, seq: 1, eventType: "lifecycle", message: "Bounded retry exhausted", createdAt: new Date(),
+    });
+    const seen = async () => {
+      const feed = await svc.list(companyId, { userId: SCOTT, actor, all: true, allowUnscopedAll: true });
+      return { items: feed.items.filter(item => item.sourceKind === "failed_run" && item.subject.id === runId), badge: feed.deskBadgeCount };
+    };
+    expect((await seen()).items).toHaveLength(1);
+    // The Inbox writes its dismissal under the bare `run:{id}` key; the card's
+    // own key is `attention:run:{id}`. Either spelling must hide the card.
+    await db.insert(inboxDismissals).values({
+      companyId, userId: SCOTT, itemKey: `run:${runId}`, kind: "dismiss", dismissedAt: new Date(), fingerprint: null,
+    });
+    const after = await seen();
+    expect(after.items).toHaveLength(0);
+    // The close endpoint's own spelling keeps working too.
+    await db.delete(inboxDismissals).where(and(eq(inboxDismissals.companyId, companyId), eq(inboxDismissals.itemKey, `run:${runId}`)));
+    expect((await seen()).items).toHaveLength(1);
+    await db.insert(inboxDismissals).values({
+      companyId, userId: SCOTT, itemKey: `attention:run:${runId}`, kind: "dismiss", dismissedAt: new Date(), fingerprint: null,
+    });
+    expect((await seen()).items).toHaveLength(0);
   });
 
   it.each(["instigator", "assignee", "conversation", "default"])("does not claim work already routed by %s", async (owner) => {

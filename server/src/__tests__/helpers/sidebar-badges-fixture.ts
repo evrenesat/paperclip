@@ -34,7 +34,26 @@ export async function observedSidebarFailures(db: Db, companyId: string, current
   }).from(heartbeatRuns).innerJoin(agents, eq(heartbeatRuns.agentId, agents.id)).where(and(
     eq(heartbeatRuns.companyId, companyId), eq(agents.companyId, companyId), not(eq(agents.status, "terminated")),
   )).orderBy(desc(heartbeatRuns.createdAt)).limit(200);
-  return latestFailedRunsByAgent(rows).filter(row => currentUserId === undefined || isHeartbeatRunVisibleInMine(row, currentUserId));
+  const issueRows = await db.select({ id: issues.id, status: issues.status }).from(issues).where(eq(issues.companyId, companyId));
+  const statusById = new Map(issueRows.map(row => [row.id, row.status]));
+  // Mirror the badge's settled-task rule: the task is done or cancelled, or a
+  // later run on the same task replaced the failure.
+  const lastRunAtByIssue = new Map<string, number>();
+  for (const row of rows) {
+    if (!row.issueId) continue;
+    lastRunAtByIssue.set(row.issueId, Math.max(lastRunAtByIssue.get(row.issueId) ?? 0, row.createdAt.getTime()));
+  }
+  const allRunAtByIssue = new Map<string, number>();
+  const laterRuns = await db.select({ issueId: heartbeatRuns.issueId, createdAt: heartbeatRuns.createdAt })
+    .from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+  for (const row of laterRuns) {
+    if (!row.issueId) continue;
+    allRunAtByIssue.set(row.issueId, Math.max(allRunAtByIssue.get(row.issueId) ?? 0, row.createdAt.getTime()));
+  }
+  return latestFailedRunsByAgent(rows).filter(row => currentUserId === undefined || isHeartbeatRunVisibleInMine(row, currentUserId))
+    .filter(row => !row.issueId
+      || (!["done", "cancelled"].includes(statusById.get(row.issueId) ?? "")
+        && (allRunAtByIssue.get(row.issueId) ?? 0) <= row.createdAt.getTime()));
 }
 
 export async function seedSidebarFixture(db: Db, mode: "mixed" | "all-failed" | "all-succeeded" | "empty" = "mixed") {
@@ -85,6 +104,27 @@ export async function seedSidebarFixture(db: Db, mode: "mixed" | "all-failed" | 
       await add("deleted", { scopeKind: "issue", issueId: deletedIssueId });
       await add("missing", { scopeKind: "issue", issueId: null });
       await add("dismissed");
+      // The badge follows the Inbox Mine page: a failure whose task settled
+      // (done, cancelled, or replaced by a later run) holds no badge number,
+      // while a blocked task's failure keeps its card and its count.
+      const doneIssueId = randomUUID(), cancelledIssueId = randomUUID(), blockedIssueId = randomUUID(), replacedIssueId = randomUUID();
+      await tx.insert(issues).values([
+        { id: doneIssueId, companyId, title: "Settled done", status: "done" },
+        { id: cancelledIssueId, companyId, title: "Settled cancelled", status: "cancelled" },
+        { id: blockedIssueId, companyId, title: "Still blocked", status: "blocked" },
+        { id: replacedIssueId, companyId, title: "Replaced by a later run", status: "blocked" },
+      ]);
+      await add("done-issue-failure", { scopeKind: "issue", issueId: doneIssueId });
+      await add("cancelled-issue-failure", { scopeKind: "issue", issueId: cancelledIssueId });
+      await add("blocked-issue-failure", { scopeKind: "issue", issueId: blockedIssueId });
+      await add("replaced-by-run-failure", { scopeKind: "issue", issueId: replacedIssueId });
+      // A later run on the same task by another agent replaces the failure the
+      // way the Inbox interruption view resolves it, without changing the
+      // failed agent's own latest run.
+      const recoveryAgentA = randomUUID();
+      await tx.insert(agents).values({ id: recoveryAgentA, companyId, name: "Recovery A", role: "engineer" });
+      runs.push({ companyId, agentId: recoveryAgentA, status: "succeeded", responsibleUserId: "user-1",
+        scopeKind: "issue", issueId: replacedIssueId, createdAt: new Date(origin + 2002) });
       for (const [name, status] of [["tied-failure-first", "failed"], ["tied-success-first", "succeeded"]] as const) {
         const agentId = await add(name, { status, createdAt: new Date(origin + 3000) });
         runs.push({ companyId, agentId, status: status === "failed" ? "succeeded" : "failed", responsibleUserId: "user-1", createdAt: new Date(origin + 3000) });

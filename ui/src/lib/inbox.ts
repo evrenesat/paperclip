@@ -338,9 +338,17 @@ export function isInboxEntityDismissed(
   itemKey: string,
   activityAt: string | Date | null | undefined,
 ): boolean {
-  const dismissedAt = dismissedAtByKey.get(itemKey);
-  if (dismissedAt == null) return false;
-  return dismissedAt >= normalizeTimestamp(activityAt);
+  // The Decisions close endpoint writes the attention card key
+  // (`attention:run:{id}`); the Inbox writes the entity key (`run:{id}`).
+  // Either spelling hides the card here.
+  const keys = itemKey.startsWith("attention:")
+    ? [itemKey, itemKey.slice("attention:".length)]
+    : [itemKey, `attention:${itemKey}`];
+  const activity = normalizeTimestamp(activityAt);
+  return keys.some((key) => {
+    const dismissedAt = dismissedAtByKey.get(key);
+    return dismissedAt != null && dismissedAt >= activity;
+  });
 }
 
 export function loadReadInboxItems(): Set<string> {

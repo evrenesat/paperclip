@@ -1,5 +1,6 @@
 import { recoveryActionAttentionCondition, ATTENTION_BUDGET_WARNING_PERCENT, ATTENTION_AGENT_ERROR_STATUS, collapsePendingConfirmationsToNewest, loadNewestSettledConfirmationAt, readRunIssueId, listFailedRunsWithNewerRun, requiresReviewAttention, terminalBlockerRequiresAttention } from "./attention-source-eligibility.js";
 import { approvalExecutionIssueCondition, firstApprovalIssueId } from "./approval-visibility.js";
+import { dismissalVariants } from "./sidebar-badges.js";
 import { and, asc, desc, eq, inArray, isNull, notInArray, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -217,24 +218,29 @@ function activeDismissalState(
   item: Pick<AttentionItem, "dismissalKey" | "activityAt" | "changeFingerprint">,
   now: number,
 ) {
-  const dismissal = dismissalByKey.get(item.dismissalKey);
-  if (!dismissal) return null;
-
-  const dismissedAt = toIso(dismissal.dismissedAt);
-  const snoozedUntil = dismissal.snoozedUntil ? toIso(dismissal.snoozedUntil) : null;
-  // PAP-749 Rule 9: a hidden card returns only on an important change. Rows
-  // saved before the fingerprint existed keep the old activity-time rule.
-  const covered = dismissalCoversChange(dismissal.fingerprint, item.changeFingerprint);
-  const isActive = dismissal.kind === "snooze"
-    ? dismissal.snoozedUntil != null && timestamp(dismissal.snoozedUntil) > now && covered !== false
-    : covered ?? timestamp(dismissal.dismissedAt) >= timestamp(item.activityAt);
-
-  return {
-    kind: dismissal.kind,
-    dismissedAt,
-    snoozedUntil,
-    isActive,
-  };
+  // The Inbox writes its dismissals under the bare entity key (`run:{id}`);
+  // the Decisions close endpoint writes `attention:run:{id}`. A card hides
+  // when either surface dismissed it, preferring the attention spelling for
+  // its fingerprint-aware return rule.
+  const candidates: DismissalState[] = [];
+  for (const key of new Set([item.dismissalKey, ...dismissalVariants(item.dismissalKey)])) {
+    const dismissal = dismissalByKey.get(key);
+    if (dismissal) candidates.push(dismissal);
+  }
+  if (candidates.length === 0) return null;
+  const states = candidates.map((dismissal) => {
+    const dismissedAt = toIso(dismissal.dismissedAt);
+    const snoozedUntil = dismissal.snoozedUntil ? toIso(dismissal.snoozedUntil) : null;
+    // PAP-749 Rule 9: a hidden card returns only on an important change. Rows
+    // saved before the fingerprint existed keep the old activity-time rule.
+    const covered = dismissalCoversChange(dismissal.fingerprint, item.changeFingerprint);
+    const isActive = dismissal.kind === "snooze"
+      ? dismissal.snoozedUntil != null && timestamp(dismissal.snoozedUntil) > now && covered !== false
+      : covered ?? timestamp(dismissal.dismissedAt) >= timestamp(item.activityAt);
+    return { dismissal, state: { kind: dismissal.kind, dismissedAt, snoozedUntil, isActive } };
+  });
+  return states.find(({ state }) => state.isActive)?.state
+    ?? states[0]!.state;
 }
 
 /**
