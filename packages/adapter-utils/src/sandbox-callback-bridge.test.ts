@@ -1620,6 +1620,10 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/start" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/stop" },
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/restart" },
+      // Tool gateway MCP bridge surface: session create, tools list, tools call
+      { method: "POST", path: "/api/tool-gateway/sessions" },
+      { method: "GET", path: "/api/tool-gateway/tools" },
+      { method: "POST", path: "/api/tool-gateway/tools/call" },
       { method: "GET", path: "/api/routines/r-1" },
       { method: "GET", path: "/api/routines/r-1/runs" },
       { method: "POST", path: "/api/companies/co-1/routines" },
@@ -1652,6 +1656,16 @@ describe("sandbox callback bridge", () => {
       // else (delete, reset, wipe, etc.) must stay denied even if the API
       // grows new actions later.
       { method: "POST", path: "/api/execution-workspaces/ws-1/runtime-services/delete" },
+      // Tool gateway over-match guards: revoke/admin routes and method or
+      // sub-path variants must stay denied at the proxy.
+      { method: "DELETE", path: "/api/tool-gateway/sessions" },
+      { method: "GET", path: "/api/tool-gateway/sessions" },
+      { method: "POST", path: "/api/tool-gateway/sessions/s-1/revoke" },
+      { method: "POST", path: "/api/tool-gateway/tools" },
+      { method: "GET", path: "/api/tool-gateway/tools/call" },
+      { method: "DELETE", path: "/api/tool-gateway/tools/call" },
+      { method: "GET", path: "/api/tool-gateway/tools/extra" },
+      { method: "POST", path: "/api/tool-gateway/action-requests/ar-1/approve" },
       { method: "POST", path: "/api/companies/co-1/agents" },
       // The hire allowlist must not over-match: only the exact .txt discovery
       // files, only agent-hires (not /agents), and no sub-resources beyond it.

@@ -231,6 +231,14 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/execution-workspaces\/[^/]+$/ },
   { method: "POST", path: /^\/api\/execution-workspaces\/[^/]+\/runtime-services\/(?:start|stop|restart)$/ },
 
+  // Tool gateway: session create, tools list, tools call — the MCP bridge on
+  // remote SSH environments reaches the gateway through this proxy. Session
+  // binding, the agent's tool profile, and approval policies stay enforced by
+  // the gateway service; revoke/admin routes below stay denied.
+  { method: "POST", path: /^\/api\/tool-gateway\/sessions$/ },
+  { method: "GET", path: /^\/api\/tool-gateway\/tools$/ },
+  { method: "POST", path: /^\/api\/tool-gateway\/tools\/call$/ },
+
   // Routines (agents manage their own routines and triggers)
   { method: "GET", path: /^\/api\/routines\/[^/]+$/ },
   { method: "GET", path: /^\/api\/routines\/[^/]+\/runs$/ },
