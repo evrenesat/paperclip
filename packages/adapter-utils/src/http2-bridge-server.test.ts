@@ -227,6 +227,44 @@ describe("createHttp2BridgeServer + createSandboxHttp2BridgeGateway", () => {
     }
   });
 
+  it("test_tool_gateway_session_token_survives_the_http2_header_filter", async () => {
+    let capturedHeaders: Record<string, string> = {};
+    const { handle, gateway } = createTestPair({
+      forwardRequest: async (request) => {
+        capturedHeaders = { ...request.headers };
+        return {
+          status: 200,
+          headers: { "content-type": "application/json" },
+          body: Buffer.from(JSON.stringify({ echoedPath: request.pathname }), "utf8"),
+        };
+      },
+    });
+    try {
+      const response = await gateway.forwardRequest({
+        method: "GET",
+        path: "/api/tool-gateway/tools",
+        query: "",
+        headers: {
+          accept: "application/json",
+          "x-paperclip-tool-gateway-token": "gateway-session-token-2",
+          "x-paperclip-run-id": "caller-run-spoof-attempt",
+        },
+        body: Buffer.alloc(0),
+        receivedToken: BRIDGE_TOKEN,
+      });
+      expect(response.status).toBe(200);
+      expect(capturedHeaders).toMatchObject({
+        accept: "application/json",
+        "x-paperclip-tool-gateway-token": "gateway-session-token-2",
+      });
+      expect(capturedHeaders.authorization).toBeUndefined();
+      expect(capturedHeaders["x-paperclip-run-id"]).toBeUndefined();
+    } finally {
+      await gateway.close();
+      await handle.close();
+    }
+  });
+
   it("test_sixty_four_concurrent_streams_all_complete", async () => {
     const seenPaths = new Set<string>();
     const { handle, gateway } = createTestPair({
