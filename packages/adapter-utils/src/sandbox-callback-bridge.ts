@@ -241,6 +241,13 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_HEADER_ALLOWLIST = [
   "if-match",
   "if-none-match",
   "x-paperclip-github-capability",
+  // Tool-gateway session token for GET /api/tool-gateway/tools and POST
+  // /api/tool-gateway/tools/call (the stdio MCP bridge on remote SSH
+  // environments sends it). It is a short-lived, session-scoped credential the
+  // sandbox already holds, and only the two gateway endpoints read it.
+  // `authorization` and `x-paperclip-run-id` stay off this list: the host
+  // injects both authoritatively after sanitization.
+  "x-paperclip-tool-gateway-token",
 ] as const;
 
 export interface SandboxCallbackBridgeRequest extends SandboxCallbackBridgeBody {

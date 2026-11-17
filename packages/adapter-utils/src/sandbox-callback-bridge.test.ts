@@ -177,7 +177,8 @@ describe("sandbox callback bridge", () => {
       client: createFileSystemSandboxCallbackBridgeQueueClient(),
       queueDir,
       authorizeRequest: async (request) =>
-        ["/api/agents/me", "/runtime-tools/github/credentials"].includes(request.path) ? null
+        ["/api/agents/me", "/runtime-tools/github/credentials", "/api/tool-gateway/tools"].includes(request.path)
+          ? null
           : request.path.endsWith("/agent-commentary") ? authorizeSandboxCallbackBridgeRequestWithRoutes(request)
           : `Route not allowed: ${request.method} ${request.path}`,
       handleRequest: async (request) => {
@@ -300,6 +301,31 @@ describe("sandbox callback bridge", () => {
     await feedbackResponse.arrayBuffer();
     expect(seenRequests[2]).toMatchObject({ method: "POST", path: "/api/companies/company-1/agent-commentary", body: feedbackBody });
     expect(seenRequests[2]?.headers.authorization).toBeUndefined();
+
+    // The tool-gateway session token must survive the proxy header filter (the
+    // stdio MCP bridge needs it on GET /tools and POST /tools/call), while the
+    // caller's authorization and run-id stay stripped: the host injects those
+    // authoritatively.
+    const toolGatewayResponse = await fetch(`${bridge.baseUrl}/api/tool-gateway/tools`, {
+      headers: {
+        authorization: `Bearer ${bridgeToken}`,
+        accept: "application/json",
+        "x-paperclip-tool-gateway-token": "gateway-session-token-1",
+        "x-paperclip-run-id": "caller-run-spoof-attempt",
+      },
+    });
+    expect(toolGatewayResponse.status).toBe(200);
+    await toolGatewayResponse.arrayBuffer();
+    expect(seenRequests[3]).toMatchObject({
+      method: "GET",
+      path: "/api/tool-gateway/tools",
+      headers: {
+        accept: "application/json",
+        "x-paperclip-tool-gateway-token": "gateway-session-token-1",
+      },
+    });
+    expect(seenRequests[3]?.headers.authorization).toBeUndefined();
+    expect(seenRequests[3]?.headers["x-paperclip-run-id"]).toBeUndefined();
 
   });
 
