@@ -32,6 +32,7 @@ import { runRetainsIssueIdentity } from "../services/task-repository-acquisition
 import { withConversationReadState } from "../services/agent-chat-read-state.js";
 import { markIssueReadSchema } from "@paperclipai/shared";
 import { enqueueFastResponse } from "../services/fast-responses.js";
+import { INTERACTION_PENDING_WAKE_REASON } from "../modules/run-dispatch/domain/wake-context.js";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA } from "../services/workspace-restore-recovery-state.js";
 import { hasUnverifiedNativeWorkspaceFinalizationOwner } from "../services/native-runtime/native-workspace-finalization-recovery-state.js";
 import { monitorPoliciesEqual, applyActorMonitorScheduledBy, assertCanManageIssueMonitor, summarizeIssueMonitor } from "../services/issue-monitors.js";
@@ -18573,7 +18574,7 @@ export function issueRoutes(
           .wakeup(interaction.addresseeAgentId, {
             source: "automation",
             triggerDetail: "system",
-            reason: "interaction_pending",
+            reason: INTERACTION_PENDING_WAKE_REASON,
             payload: {
               issueId: issue.id,
               interactionId: interaction.id,
@@ -18592,7 +18593,7 @@ export function issueRoutes(
               interactionKind: interaction.kind,
               sourceCommentId: interaction.sourceCommentId ?? null,
               sourceRunId: interaction.sourceRunId ?? null,
-              wakeReason: "interaction_pending",
+              wakeReason: INTERACTION_PENDING_WAKE_REASON,
               source: "issue.interaction.created",
             },
           })
