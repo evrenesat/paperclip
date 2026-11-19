@@ -35,6 +35,7 @@ function baseGateFacts(): ScheduledRetryFacts {
     issueAssigneeAgentId: "agent-1",
     issueExecutionRunId: "run-1",
     isNonAssigneeWorkspaceBusyRetry: false,
+    isAddresseeInteractionWake: false,
     reviewParticipant: NO_PARTICIPANT,
     activePauseHold: null,
     dependenciesBlocked: null,
@@ -54,6 +55,7 @@ function baseStalenessFacts(): QueuedRunFacts {
     issueExecutionRunId: "run-1",
     isResolvedInteractionContinuation: false,
     isInteractionWake: false,
+    isAddresseeInteractionWake: false,
     isAuthorizedSourceScopedRecovery: false,
     isNonAssigneeWorkspaceBusyRetry: false,
     resumeIntent: false,
@@ -474,6 +476,32 @@ describe("decideQueuedRunStaleness", () => {
       isAuthorizedSourceScopedRecovery: true,
     };
     expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("allows a DB-verified addressee-interaction wake to bypass the ownership check", () => {
+    const facts: QueuedRunFacts = {
+      ...baseStalenessFacts(),
+      issueAssigneeAgentId: "agent-2",
+      isAddresseeInteractionWake: true,
+    };
+    expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+  });
+
+  it("does not let the addressee-interaction bypass relax the strict early continuation ownership check", () => {
+    expect(decideQueuedRunStaleness({
+      ...baseStalenessFacts(),
+      isResolvedInteractionContinuation: true,
+      issueAssigneeAgentId: "agent-2",
+      isAddresseeInteractionWake: true,
+    }, NOW)).toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+  });
+
+  it("allows an addressee-interaction retry to pass the retry gate's ownership check", () => {
+    expect(decideScheduledRetryGate({
+      ...baseGateFacts(),
+      issueAssigneeAgentId: "agent-2",
+      isAddresseeInteractionWake: true,
+    }, NOW)).toEqual({ allowed: true });
   });
 });
 

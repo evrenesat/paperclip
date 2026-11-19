@@ -1,5 +1,5 @@
 import type { Db } from "@paperclipai/db";
-import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issues } from "@paperclipai/db";
+import { agents, agentWakeupRequests, companies, createDb, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS, heartbeatRuns, issueThreadInteractions, issues } from "@paperclipai/db";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "../../__tests__/helpers/embedded-postgres.js";
@@ -183,5 +183,77 @@ describe.skipIf(!support.supported)("heartbeat queue database wiring", () => {
     expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledWith(cancelled, { suppressImmediateRecovery: true });
     expect(deps.treeControlSvc.getActivePauseHoldGate).not.toHaveBeenCalled();
     expect(deps.executeRun).not.toHaveBeenCalled();
+  });
+
+  describe("addressee interaction wake claims", () => {
+    async function fixtureAddressedCard(input: { unresolvedBlockers?: number } = {}) {
+      const [company] = await db.insert(companies).values({ name: "Queue module", issuePrefix: "QM", defaultResponsibleUserId: "responsible-user" }).returning();
+      const [assignee] = await db.insert(agents).values({ companyId: company.id, name: "Assignee", role: "engineer", status: "idle", adapterType: "process", adapterConfig: {} }).returning();
+      const [addressee] = await db.insert(agents).values({ companyId: company.id, name: "Addressee", role: "reviewer", status: "active", adapterType: "process", adapterConfig: {} }).returning();
+      const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Review request", status: "in_progress", priority: "medium", assigneeAgentId: assignee.id }).returning();
+      const [interaction] = await db.insert(issueThreadInteractions).values({
+        companyId: company.id,
+        issueId: issue.id,
+        kind: "request_confirmation",
+        status: "pending",
+        payload: { version: 1, prompt: "Review and confirm the plan revision." },
+        addresseeAgentId: addressee.id,
+      }).returning();
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: addressee.id, source: "automation", status: "queued" }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({
+        companyId: company.id,
+        agentId: addressee.id,
+        status: "queued",
+        invocationSource: "automation",
+        triggerDetail: "system",
+        wakeupRequestId: wake.id,
+        contextSnapshot: {
+          issueId: issue.id,
+          taskId: issue.id,
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          sourceCommentId: null,
+          sourceRunId: null,
+          wakeReason: "interaction_pending",
+          source: "issue.interaction.created",
+        },
+      }).returning();
+      const deps = callbacks(db);
+      deps.getAgent.mockResolvedValue(addressee);
+      if (input.unresolvedBlockers) {
+        const blockerIds = Array.from({ length: input.unresolvedBlockers }, () => crypto.randomUUID());
+        deps.issuesSvc.listDependencyReadiness.mockResolvedValue(new Map([[
+          issue.id,
+          { isDependencyReady: false, unresolvedBlockerIssueIds: blockerIds, unresolvedBlockerCount: blockerIds.length },
+        ]]));
+      }
+      return { company, assignee, addressee, issue, interaction, wake, run, deps };
+    }
+
+    it("claims an addressee wake whose card is still pending on an issue assigned to another agent", async () => {
+      const f = await fixtureAddressedCard();
+      const claimed = await createHeartbeatQueue(db, f.deps).claimQueuedRun(f.run);
+      expect(claimed).not.toBeNull();
+      expect(claimed).toMatchObject({ id: f.run.id, status: "running" });
+      expect(f.deps.cancelRunInternal).not.toHaveBeenCalled();
+    });
+
+    it("claims the same addressee wake past the dependency gate instead of cancelling it", async () => {
+      const f = await fixtureAddressedCard({ unresolvedBlockers: 1 });
+      const claimed = await createHeartbeatQueue(db, f.deps).claimQueuedRun(f.run);
+      expect(claimed).not.toBeNull();
+      expect(claimed).toMatchObject({ id: f.run.id, status: "running" });
+      const [persisted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+      expect(persisted?.status).toBe("running");
+      expect(persisted?.errorCode).toBeNull();
+    });
+
+    it("still cancels the addressee wake once its card is no longer pending", async () => {
+      const f = await fixtureAddressedCard();
+      await db.update(issueThreadInteractions).set({ status: "answered" }).where(eq(issueThreadInteractions.id, f.interaction.id));
+      expect(await createHeartbeatQueue(db, f.deps).claimQueuedRun(f.run)).toBeNull();
+      const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+      expect(cancelled).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed" });
+    });
   });
 });

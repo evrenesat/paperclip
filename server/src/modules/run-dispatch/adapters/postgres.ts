@@ -10,6 +10,7 @@ import {
   heartbeatRuns,
   issueRecoveryActions,
   issueComments,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
 import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON } from "@paperclipai/shared";
@@ -22,6 +23,7 @@ import { isCompletedOnboardingHandoffWake } from "../../../services/chat-complet
 import { isHeartbeatWakeOnDemandEnabled } from "../../../services/heartbeat-policy.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "../../../services/delivery-work-notifications.js";
 import { connectionContinuationPendingResponse } from "../../../services/satisfied-connection-intents.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "../../../services/issue-thread-interaction-resolution.js";
 import { collectDispositionRepairSourceState } from "../../../services/recovery/disposition-repair.js";
 import { legacyDispositionEpisode, legacyDispositionFingerprint } from "../../../services/recovery/legacy-continuation.js";
 import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.js";
@@ -50,6 +52,7 @@ import {
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  readAddresseeInteractionWakeContext,
 } from "../domain/wake-context.js";
 import type {
   CancelStaleQueuedRunInput,
@@ -123,6 +126,63 @@ async function readNativeReviewParticipantFacts(db: Db, input: {
     participantAgentId: input.agentId, currentStageType: "native_completion_review",
     currentParticipant: { type: "agent", agentId: input.agentId, interactionId: review.interaction.id },
   } : null;
+}
+
+/**
+ * DB-verified authority for an addressee interaction wake: the queued run
+ * targets an agent the card is still addressed to. True only while the
+ * interaction row still exists on this company+issue, is still pending, and
+ * would still be allowed to wake that agent at creation time (the same
+ * resolver-audience check the creation route runs before it wakes the
+ * addressee). The cheap context-shape classifier runs first, so runs whose
+ * context never matched the addressee-wake shape pay no query at all.
+ */
+export async function readAddresseeInteractionWakeFact(
+  dbOrTx: Db,
+  input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    contextSnapshot: Record<string, unknown>;
+  },
+): Promise<boolean> {
+  const wake = readAddresseeInteractionWakeContext(input.contextSnapshot);
+  if (!wake) return false;
+  const [interaction] = await dbOrTx
+    .select({
+      kind: issueThreadInteractions.kind,
+      status: issueThreadInteractions.status,
+      payload: issueThreadInteractions.payload,
+      createdByAgentId: issueThreadInteractions.createdByAgentId,
+      createdByUserId: issueThreadInteractions.createdByUserId,
+      sourceRunId: issueThreadInteractions.sourceRunId,
+      addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+      addresseeUserId: issueThreadInteractions.addresseeUserId,
+      effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+      resolverPolicyProvenance: issueThreadInteractions.resolverPolicyProvenance,
+    })
+    .from(issueThreadInteractions)
+    .where(
+      and(
+        eq(issueThreadInteractions.id, wake.interactionId),
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, input.issueId),
+      ),
+    )
+    .limit(1);
+  if (!interaction || interaction.status !== "pending") return false;
+  if (interaction.addresseeAgentId !== input.agentId) return false;
+  const governedAction =
+    interaction.kind === "request_confirmation" &&
+    typeof interaction.payload === "object" &&
+    interaction.payload !== null &&
+    "toolAction" in interaction.payload &&
+    interaction.payload.toolAction !== undefined;
+  return issueThreadInteractionAttentionAgentAllowed({
+    agentId: input.agentId,
+    interaction,
+    governedAction,
+  });
 }
 
 function readNonEmptyString(value: unknown): string | null {
@@ -307,6 +367,7 @@ export function createPostgresRunDispatchAdapter(
       issueStatus: null,
       issueAssigneeAgentId: null,
       issueExecutionRunId: null,
+      isAddresseeInteractionWake: false,
       reviewParticipant: NO_REVIEW_PARTICIPANT,
       activePauseHold: null,
       dependenciesBlocked: null,
@@ -378,6 +439,18 @@ export function createPostgresRunDispatchAdapter(
       isInReview: issue.status === "in_review",
       executionState: parseIssueExecutionState(issue.executionState),
     });
+    // Must land before the next isBlocked(): the ownership rule reads it, so
+    // a first isBlocked() call above this line could report the wrong
+    // suppression reason for an admitted addressee wake.
+    facts.isAddresseeInteractionWake = await readAddresseeInteractionWakeFact(
+      dbOrTx as unknown as Db,
+      {
+        companyId: input.companyId,
+        issueId,
+        agentId: input.agentId,
+        contextSnapshot: input.contextSnapshot,
+      },
+    );
 
     // The gate checks a disposition repair's own supersession before it
     // checks ownership or status, so this read must land before the next
@@ -609,6 +682,14 @@ export function createPostgresRunDispatchAdapter(
       isConnectionContinuation: (isResolvedInteractionContinuation && context.interactionKind === "connection_intent")
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
+      isAddresseeInteractionWake: issue
+        ? await readAddresseeInteractionWakeFact(dbOrTx as unknown as Db, {
+            companyId: input.companyId,
+            issueId,
+            agentId: input.agentId,
+            contextSnapshot: context,
+          })
+        : false,
       isAuthorizedSourceScopedRecovery,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
@@ -1074,14 +1155,19 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus) return { outcome: "lost_race" as const };
       const { issueId, facts, decision, executionBlocker } = await decideCurrentRunStaleness(tx, run, input.now);
       if (!decision.stale || !issueId) {
-        if (input.expectedStatus === "queued" && facts?.isInteractionWake) {
+        if (
+          input.expectedStatus === "queued" &&
+          (facts?.isInteractionWake || facts?.isAddresseeInteractionWake)
+        ) {
           // Preserve the authority accepted under the issue/run locks. Later
           // preflight reads can observe a reassignment; they must not turn an
-          // assignee comment into a non-assignee subscription-wait exception.
+          // admitted non-assignee comment or addressee-interaction wake into a
+          // subscription-wait exception that pretends the run was deferred
+          // while it owned the issue.
           await tx.update(heartbeatRuns).set({
             runnerProfileJson: {
               ...parseObject(run.runnerProfileJson),
-              aiConnectionNonAssigneeCommentWake: facts.issueAssigneeAgentId !== run.agentId,
+              aiConnectionNonAssigneeCommentWake: facts!.issueAssigneeAgentId !== run.agentId,
             },
           }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
         }

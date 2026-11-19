@@ -1,10 +1,13 @@
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   allowsIssueInteractionWake,
   deriveCommentId,
   extractWakeCommentIds,
+  INTERACTION_CREATED_WAKE_SOURCE,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  readAddresseeInteractionWakeContext,
   WORKSPACE_BUSY_RETRY_REASON,
 } from "./wake-context.js";
 
@@ -97,6 +100,47 @@ describe("wake context", () => {
       expect(isResolvedInteractionContinuationWakeContext(null)).toBe(false);
     },
   );
+
+  const addresseeWakeContext = (overrides: Record<string, unknown> = {}) => ({
+    issueId: randomUUID(),
+    interactionId: randomUUID(),
+    interactionKind: "request_confirmation",
+    wakeReason: "interaction_pending",
+    source: INTERACTION_CREATED_WAKE_SOURCE,
+    ...overrides,
+  });
+
+  it("recognizes the addressee-interaction wake the creation route writes", () => {
+    const context = addresseeWakeContext();
+    expect(readAddresseeInteractionWakeContext(context)).toEqual({ interactionId: context.interactionId });
+  });
+
+  it("still recognizes an addressee wake after a bounded retry overwrote wakeReason", () => {
+    const source = addresseeWakeContext();
+    const retry = {
+      ...source,
+      retryOfRunId: randomUUID(),
+      wakeReason: "ai_connection_busy_retry",
+      retryReason: "ai_connection_busy",
+      scheduledRetryAttempt: 1,
+    };
+    expect(readAddresseeInteractionWakeContext(retry)).toEqual({ interactionId: source.interactionId });
+  });
+
+  it.each([
+    { label: "missing source", overrides: { source: undefined } },
+    { label: "different source", overrides: { source: "issue.commented" } },
+    { label: "missing interactionId", overrides: { interactionId: undefined } },
+    { label: "non-uuid interactionId", overrides: { interactionId: "interaction-1" } },
+    { label: "blank interactionId", overrides: { interactionId: "   " } },
+  ])("rejects an addressee wake shape with $label", ({ overrides }) => {
+    expect(readAddresseeInteractionWakeContext(addresseeWakeContext(overrides))).toBeNull();
+  });
+
+  it("rejects null or undefined addressee wake contexts", () => {
+    expect(readAddresseeInteractionWakeContext(null)).toBeNull();
+    expect(readAddresseeInteractionWakeContext(undefined)).toBeNull();
+  });
 });
 
  it("preserves non-assignee pool wait authority", () => {

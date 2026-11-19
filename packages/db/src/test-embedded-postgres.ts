@@ -35,6 +35,7 @@ type EmbeddedPostgresCtor = new (opts: {
   initdbFlags?: string[];
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
+  createPostgresUser?: boolean;
 }) => EmbeddedPostgresInstance;
 
 export type EmbeddedPostgresTestSupport = {
@@ -143,6 +144,10 @@ async function createEmbeddedPostgresTestInstanceAt(dataDir: string) {
     port,
     persistent: true,
     initdbFlags: EMBEDDED_POSTGRES_INITDB_FLAGS,
+    // Postgres refuses to run as root. On a root host (a dev sandbox), let the
+    // driver create a dedicated postgres OS user and chown the data dir to it
+    // instead of skipping every database-backed suite.
+    createPostgresUser: process.getuid?.() === 0,
     onLog: (message) => logBuffer.append(message),
     onError: (message) => logBuffer.append(message),
   });

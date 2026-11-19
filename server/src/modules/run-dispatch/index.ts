@@ -24,6 +24,7 @@ export {
   allowsIssueInteractionWake,
   isResolvedInteractionContinuationWakeContext,
 } from "./domain/wake-context.js";
+export { readAddresseeInteractionWakeFact } from "./adapters/postgres.js";
 export type {
   RetryReasonKind,
   BudgetBlockFacts,

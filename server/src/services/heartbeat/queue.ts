@@ -142,7 +142,10 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { allowsIssueInteractionWake } from "../../modules/run-dispatch/index.js";
+import {
+  allowsIssueInteractionWake,
+  readAddresseeInteractionWakeFact,
+} from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -1087,7 +1090,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !allowsIssueInteractionWake(
           context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
-        )
+        ) &&
+        // A still-pending card addressed to this run's agent keeps its own
+        // wake path: the assignee cannot resolve an addressee-restricted card,
+        // so cancelling here would strand the card until the blockers clear,
+        // if they ever do. The fact helper DB-verifies the card under the same
+        // authority the staleness gate accepts.
+        !(await readAddresseeInteractionWakeFact(db, {
+          companyId: run.companyId,
+          issueId,
+          agentId: run.agentId,
+          contextSnapshot: context,
+        }))
       ) {
         await cancelQueuedRunForBlockedDependencies(
           run,

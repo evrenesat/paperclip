@@ -5,6 +5,8 @@
 // independently maintained copy in either file could silently drift out of
 // sync with the other and change only one of the two gates that read it.
 
+import { isUuidLike } from "@paperclipai/shared";
+
 function parseObject(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -21,6 +23,8 @@ export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
+export const INTERACTION_PENDING_WAKE_REASON = "interaction_pending";
+export const INTERACTION_CREATED_WAKE_SOURCE = "issue.interaction.created";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 export const RESOLVED_INTERACTION_CONTINUATION_STATUSES = new Set([
   "accepted",
@@ -108,4 +112,35 @@ export function isResolvedInteractionContinuationWakeContext(contextSnapshot: un
     wakeReason === INTERACTION_CONTINUATION_INFRA_WAKE_REASON ||
     retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON
   );
+}
+
+/**
+ * Recognizes the context shape only the issue-thread-interaction creation
+ * route writes when it wakes a card's addressee
+ * (`routes/issues.ts`, source `issue.interaction.created`). The shape check is
+ * deliberately cheap and context-only; the gates that consume it re-verify the
+ * card itself against the database, which is the real authority.
+ *
+ * `wakeReason` is deliberately NOT required. The creation wake carries
+ * `interaction_pending`, but `scheduleBoundedRetryForRun` rebuilds a retry's
+ * context as `{ ...contextSnapshot, retryOfRunId, wakeReason, retryReason, ... }`
+ * (`services/heartbeat/retries.ts`), overwriting `wakeReason` with the retry's
+ * own reason while inheriting `source` and `interactionId` verbatim. A
+ * wake-reason requirement would silently turn the scheduled-retry gate's
+ * bypass into dead code — exactly the class of stall this classifier exists to
+ * fix. The single producer of this source/interactionId pair is the creation
+ * route itself, so the pair alone identifies the class.
+ */
+export function readAddresseeInteractionWakeContext(
+  contextSnapshot: Record<string, unknown> | null | undefined,
+): { interactionId: string } | null {
+  const context = parseObject(contextSnapshot);
+  if (readNonEmptyString(context.source) !== INTERACTION_CREATED_WAKE_SOURCE) {
+    return null;
+  }
+  const interactionId = readNonEmptyString(context.interactionId);
+  // The gate's follow-up read targets a uuid primary key; rejecting a
+  // non-uuid id here keeps a malformed context from reaching the database.
+  if (!interactionId || !isUuidLike(interactionId)) return null;
+  return { interactionId };
 }

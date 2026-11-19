@@ -14,6 +14,7 @@ import {
   issueDocuments,
   issueRelations,
   issueRecoveryActions,
+  issueThreadInteractions,
   issueTreeHolds,
   issues,
 } from "@paperclipai/db";
@@ -129,6 +130,32 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       assigneeAgentId: input.assigneeAgentId ?? null,
       executionState: input.executionState ?? null,
     });
+  }
+
+  async function seedAddresseeInteraction(input: {
+    companyId: string;
+    issueId: string;
+    interactionId?: string;
+    addresseeAgentId?: string | null;
+    createdByAgentId?: string | null;
+    status?: string;
+    effectiveResolverPolicy?: "anyone" | "human_only" | "not_creator";
+  }) {
+    const [interaction] = await db
+      .insert(issueThreadInteractions)
+      .values({
+        ...(input.interactionId ? { id: input.interactionId } : {}),
+        companyId: input.companyId,
+        issueId: input.issueId,
+        kind: "request_confirmation",
+        status: input.status ?? "pending",
+        payload: { version: 1, prompt: "Confirm the plan revision before implementation." },
+        addresseeAgentId: input.addresseeAgentId ?? null,
+        createdByAgentId: input.createdByAgentId ?? null,
+        effectiveResolverPolicy: input.effectiveResolverPolicy ?? "anyone",
+      })
+      .returning();
+    return interaction!;
   }
 
   async function seedRun(input: {
@@ -724,6 +751,89 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       });
     });
 
+    describe("addressee interaction wake", () => {
+      async function seedAddresseeWake(input: {
+        interactionStatus?: string;
+        addresseeAgentId?: string | null | "assignee";
+        createdByAgentId?: string | null;
+        effectiveResolverPolicy?: "anyone" | "human_only" | "not_creator";
+      } = {}) {
+        const { companyId } = await seedCompanyAndAgent();
+        const assigneeId = randomUUID();
+        const addresseeId = randomUUID();
+        await seedAgent({ id: assigneeId, companyId, name: "Assignee" });
+        await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+        const issueId = randomUUID();
+        await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+        const interaction = await seedAddresseeInteraction({
+          companyId,
+          issueId,
+          addresseeAgentId: input.addresseeAgentId === undefined
+            ? addresseeId
+            : input.addresseeAgentId === "assignee" ? assigneeId : input.addresseeAgentId,
+          createdByAgentId: input.createdByAgentId === "self" ? addresseeId : input.createdByAgentId ?? null,
+          status: input.interactionStatus ?? "pending",
+          effectiveResolverPolicy: input.effectiveResolverPolicy,
+        });
+        const runId = await seedRun({
+          companyId,
+          agentId: addresseeId,
+          contextSnapshot: {
+            issueId,
+            taskId: issueId,
+            interactionId: interaction.id,
+            interactionKind: interaction.kind,
+            sourceCommentId: null,
+            sourceRunId: null,
+            wakeReason: "interaction_pending",
+            source: "issue.interaction.created",
+          },
+        });
+        return { companyId, assigneeId, addresseeId, issueId, interactionId: interaction.id, runId };
+      }
+
+      it("keeps a queued addressee wake whose card is still pending and addressed to the run's agent, recording the non-assignee authority", async () => {
+        const f = await seedAddresseeWake();
+        const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId: f.runId,
+          companyId: f.companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+        expect(outcome).toMatchObject({ outcome: "not_stale" });
+        const [run] = await db.select({ runnerProfileJson: heartbeatRuns.runnerProfileJson })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, f.runId));
+        expect(run?.runnerProfileJson).toMatchObject({ aiConnectionNonAssigneeCommentWake: true });
+      });
+
+      it.each([
+        { label: "the card was resolved", overrides: { interactionStatus: "answered" } },
+        { label: "the card is addressed to the assignee instead", overrides: { addresseeAgentId: "assignee" } },
+        { label: "the card lost its addressee", overrides: { addresseeAgentId: null } },
+        { label: "the card is human-only", overrides: { effectiveResolverPolicy: "human_only" as const } },
+        { label: "the addressee created its own not-creator card", overrides: { createdByAgentId: "self", effectiveResolverPolicy: "not_creator" as const } },
+      ])("cancels an addressee wake when $label", async ({ overrides }) => {
+        const f = await seedAddresseeWake(overrides);
+        const outcome = await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({
+          runId: f.runId,
+          companyId: f.companyId,
+          expectedStatus: "queued",
+          now: new Date(),
+        });
+        expect(outcome).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+      });
+
+      it("cancels an addressee wake when its card is missing or lives on another issue", async () => {
+        const f = await seedAddresseeWake();
+        const adapter = createPostgresRunDispatchAdapter(db);
+        await db.delete(issueThreadInteractions).where(eq(issueThreadInteractions.id, f.interactionId));
+        expect(await adapter.cancelStaleQueuedRun({
+          runId: f.runId, companyId: f.companyId, expectedStatus: "queued", now: new Date(),
+        })).toMatchObject({ outcome: "cancelled", errorCode: "issue_assignee_changed" });
+      });
+    });
+
     it(
       "reads the locked issue state and cancels in the same semantic transaction",
       async () => {
@@ -846,6 +956,120 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
         now,
       });
 
+      expect(outcome.outcome).toBe("promoted");
+      const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(row?.status).toBe("queued");
+    });
+
+    it("promotes an AI-busy retry of an admitted addressee wake whose card is still pending and addressed to the retry's agent", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const assigneeId = randomUUID();
+      const addresseeId = randomUUID();
+      await seedAgent({ id: assigneeId, companyId, name: "Assignee" });
+      await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const interaction = await seedAddresseeInteraction({ companyId, issueId, addresseeAgentId: addresseeId });
+      const sourceRunId = randomUUID();
+      await db.insert(heartbeatRuns).values({
+        id: sourceRunId,
+        companyId,
+        agentId: addresseeId,
+        invocationSource: "automation",
+        status: "cancelled",
+        errorCode: "ai_connection_busy",
+        contextSnapshot: {
+          issueId,
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          wakeReason: "interaction_pending",
+          source: "issue.interaction.created",
+          // The authority the admission gate recorded for the cancelled wake.
+          aiConnectionBusyDeferredWhileAssignee: false,
+        },
+      });
+      const runId = randomUUID();
+      const now = new Date();
+      // scheduleBoundedRetryForRun rebuilds the context with the retry's own
+      // wakeReason and retryReason, inheriting source and interactionId.
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: addresseeId,
+        invocationSource: "retry",
+        status: "scheduled_retry",
+        retryOfRunId: sourceRunId,
+        scheduledRetryAttempt: 1,
+        scheduledRetryAt: now,
+        scheduledRetryReason: "ai_connection_busy",
+        contextSnapshot: {
+          issueId,
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          source: "issue.interaction.created",
+          aiConnectionBusyDeferredWhileAssignee: false,
+          retryOfRunId: sourceRunId,
+          wakeReason: "ai_connection_busy_retry",
+          retryReason: "ai_connection_busy",
+          failureRetriesBeforeAiConnectionWait: 1,
+          scheduledRetryAttempt: 1,
+          scheduledRetryAt: now.toISOString(),
+        },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const outcome = await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({
+        runId,
+        companyId,
+        now,
+      });
+      expect(outcome.outcome).toBe("promoted");
+      const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+      expect(row?.status).toBe("queued");
+    });
+
+    it("promotes a transient retry of a pending addressee card even though no other ownership bypass fits it", async () => {
+      const { companyId } = await seedCompanyAndAgent();
+      const assigneeId = randomUUID();
+      const addresseeId = randomUUID();
+      await seedAgent({ id: assigneeId, companyId, name: "Assignee" });
+      await seedAgent({ id: addresseeId, companyId, name: "Addressee" });
+      const issueId = randomUUID();
+      await seedIssue({ companyId, issueId, status: "in_progress", assigneeAgentId: assigneeId });
+      const interaction = await seedAddresseeInteraction({ companyId, issueId, addresseeAgentId: addresseeId });
+      const runId = randomUUID();
+      const now = new Date();
+      await db.insert(heartbeatRuns).values({
+        id: runId,
+        companyId,
+        agentId: addresseeId,
+        invocationSource: "retry",
+        status: "scheduled_retry",
+        scheduledRetryAttempt: 1,
+        scheduledRetryAt: now,
+        scheduledRetryReason: "transient_failure",
+        contextSnapshot: {
+          issueId,
+          interactionId: interaction.id,
+          interactionKind: interaction.kind,
+          source: "issue.interaction.created",
+          retryOfRunId: randomUUID(),
+          // The retry overwrote the creation wake's `interaction_pending`.
+          wakeReason: "transient_failure_retry",
+          retryReason: "transient_failure",
+          scheduledRetryAttempt: 1,
+          scheduledRetryAt: now.toISOString(),
+        },
+        createdAt: now,
+        updatedAt: now,
+      });
+
+      const outcome = await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({
+        runId,
+        companyId,
+        now,
+      });
       expect(outcome.outcome).toBe("promoted");
       const [row] = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       expect(row?.status).toBe("queued");
