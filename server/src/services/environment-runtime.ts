@@ -35,7 +35,7 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { SSH_REMOTE_STOP_CONTRACT, hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
 import { sshRunStopFailure, stopSshRunProcesses } from "./ssh-run-stop.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
@@ -1193,6 +1193,7 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
+          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
         },
       });
@@ -1269,6 +1270,7 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
+          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
           host: parsed.config.host,
           port: parsed.config.port,
@@ -2163,6 +2165,7 @@ function createSandboxEnvironmentDriver(
         const pluginLeaseMetadata = {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
+          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: pluginProvider.resolved.plugin.id,
           pluginKey: pluginProvider.resolved.plugin.pluginKey,
@@ -3741,6 +3744,7 @@ function createPluginEnvironmentDriver(
           environmentId: input.environment.id,
           ...(input.purpose !== "login" && input.adapterType === "paperclip_runner" && driver.supportsTasks === true ? { runnerTaskLease: true } : {}),
           driver: input.environment.driver,
+          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,
           pluginKey: parsed.config.pluginKey,
