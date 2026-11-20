@@ -149,7 +149,13 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedLease(options: { metadata?: Record<string, unknown>; status?: string } = {}) {
+  async function seedLease(options: {
+    metadata?: Record<string, unknown>;
+    status?: string;
+    leaseStatus?: string;
+    cleanupStatus?: string;
+    failureReason?: string;
+  } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const environmentId = randomUUID();
@@ -198,10 +204,12 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
       companyId,
       environmentId,
       heartbeatRunId: runId,
-      status: "active",
+      status: options.leaseStatus ?? "active",
       leasePolicy: "ephemeral",
       provider: "ssh",
       providerLeaseId: "ssh://ssh.example.test/workspace",
+      cleanupStatus: options.cleanupStatus,
+      failureReason: options.failureReason,
       metadata: options.metadata ?? {},
     });
     return { companyId, environmentId, runId, leaseId };
@@ -290,6 +298,33 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
       cleanupStatus: "failed",
       failureReason: "ssh_remote_stop_failed",
     });
+  });
+
+  it("retries the remote stop for a pending_cleanup lease and returns a bound stop proof", async () => {
+    const { environmentId, runId, leaseId } = await seedLease({
+      leaseStatus: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "ssh_remote_stop_failed",
+    });
+    const runner = vi.fn(async () => ({
+      stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n",
+      stderr: "",
+    }));
+    setSshRunStopRunnerForTests(runner);
+
+    const [environment] = await db.select().from(environments).where(eq(environments.id, environmentId));
+    const lease = await leaseRow(leaseId);
+    expect(lease).not.toBeNull();
+
+    await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
+      environment: environment ?? null,
+      lease: lease!,
+    })).resolves.toEqual({
+      providerLeaseId: "ssh://ssh.example.test/workspace",
+      state: "stopped",
+    });
+    expect(runner).toHaveBeenCalledOnce();
+    expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
   });
 
   it("does not repeat the remote stop when the lease already carries its receipt", async () => {
