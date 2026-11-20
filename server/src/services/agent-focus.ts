@@ -340,33 +340,40 @@ export function agentFocusService(db: Db, deps: AgentFocusDeps) {
       focusedIdentifier,
       input.note ?? null,
     );
-    const comment =
-      input.mode === "gracefully" && otherRuns.length > 0
-        ? await deps.issues.addComment(issue.id, switchCommentBody, {}, {
-            authorType: "system",
-          })
-        : null;
 
     for (const run of otherRuns) {
       if (run.status !== "running") continue;
-      if (input.mode === "gracefully" && comment) {
+      const oldRunIssueId = runIssueId(run);
+      if (input.mode === "gracefully" && oldRunIssueId) {
+        // The switch comment lands on the issue being left, where the agent
+        // can wrap up and leave its resume note.
+        let comment: { id: string; body: string } | null = null;
         try {
-          const acknowledgement = await steerNativeSession({
-            runId: run.id,
-            message: switchCommentBody,
-            correlationId: comment.id,
+          comment = await deps.issues.addComment(oldRunIssueId, switchCommentBody, {}, {
+            authorType: "system",
           });
-          await recordSteerAcknowledgement(
-            db,
-            run.id,
-            comment.id,
-            acknowledgement.turnId,
-            issue.id,
-          );
-          steerAcknowledgedRunIds.push(run.id);
-          continue;
         } catch {
-          // The adapter cannot be steered; the grace-window sweep cancels it.
+          comment = null;
+        }
+        if (comment) {
+          try {
+            const acknowledgement = await steerNativeSession({
+              runId: run.id,
+              message: switchCommentBody,
+              correlationId: comment.id,
+            });
+            await recordSteerAcknowledgement(
+              db,
+              run.id,
+              comment.id,
+              acknowledgement.turnId,
+              issue.id,
+            );
+            steerAcknowledgedRunIds.push(run.id);
+            continue;
+          } catch {
+            // The adapter cannot be steered; the grace-window sweep cancels it.
+          }
         }
       }
       if (input.mode === "right_away") {
