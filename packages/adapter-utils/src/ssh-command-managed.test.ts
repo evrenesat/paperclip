@@ -12,9 +12,11 @@ vi.mock("node:child_process", async (importOriginal) => {
       if (file !== "ssh") throw new Error(`Unexpected subprocess ${file}`);
       return actual.execFile("sh", ["-c", args.at(-1)!], options, callback);
     }),
+    // sshd runs the remote command in a new session, so its shell is already a
+    // process-group leader. Mirror that here to exercise the setsid path.
     spawn: vi.fn((file: string, args: string[], options: Parameters<typeof actual.spawn>[2]) => {
       if (path.basename(file) !== "ssh") throw new Error(`Unexpected subprocess ${file}`);
-      return actual.spawn("sh", ["-c", args.at(-1)!], options);
+      return actual.spawn("sh", ["-c", `exec ${args.at(-1)!}`], { ...options, detached: true });
     }),
   };
 });
@@ -59,6 +61,29 @@ describe("SSH command-managed argv", () => {
     const [runId, sid] = result.stdout.trim().split(/\s+/);
     expect(runId).toBe("run-fixture");
     expect(Number(sid)).toBeGreaterThan(0);
+  });
+
+  it("propagates the remote exit status instead of a forked session leader's", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "ssh-exit-status-"));
+    roots.push(cwd);
+    const result = await runChildProcess("exit-status", "sh", ["-c", "exit 7"], {
+      cwd,
+      env: {},
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+      remoteExecution: {
+        host: "fixture.invalid",
+        username: "fixture",
+        port: 22,
+        remoteCwd: cwd,
+        remoteWorkspacePath: cwd,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    });
+    expect(result.exitCode).toBe(7);
   });
 
   it("forwards a dispatch run id into the remote launch environment", async () => {

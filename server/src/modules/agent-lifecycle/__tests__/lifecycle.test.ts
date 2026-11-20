@@ -1193,7 +1193,7 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await request(app(board)).post(url).send({ runId: run.id, leaseId: sandboxLease.id, note: "wrong provider" }).expect(409);
   });
 
-  it("releases a stuck SSH pending_cleanup lease with an attestation but never clears a failed cleanup", async () => {
+  it("releases a stuck SSH pending_cleanup lease and clears the failed cleanup on attestation", async () => {
     const agent = await hire();
     function app(actor: Express.Request["actor"]) {
       const app = express(); app.use(express.json());
@@ -1218,10 +1218,10 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
 
     const [failedLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
       provider: "ssh", providerLeaseId: "ssh://host/workdir-2", status: "pending_cleanup", cleanupStatus: "failed" }).returning();
-    await request(app(board)).post(url).send({ runId: run.id, leaseId: failedLease.id, note: "still failing" }).expect(200);
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: failedLease.id, note: "verified stopped" }).expect(200);
     const [failed] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, failedLease.id));
-    expect(failed).toMatchObject({ status: "released", cleanupStatus: "failed" });
-    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
+    expect(failed).toMatchObject({ status: "released", cleanupStatus: "success", failureReason: null });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
   });
 
   it("recovers an expired lease and never accepts an expired completion", async () => {

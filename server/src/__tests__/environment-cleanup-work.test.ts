@@ -367,6 +367,16 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
     expect((await environmentService(db).getLeaseById(lease.id))?.status).toBe("expired");
     await quiet();
   });
+  it("does not treat an absent local SSH client as remote stop proof", async () => {
+    const [agent] = await db.insert(agents).values({ companyId, name: "SSH workspace owner" }).returning();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      runtimeMode: "legacy", invocationSource: "on_demand", processPid: 2_000_000_000,
+      startedAt: new Date(Date.now() - 60_000), finishedAt: new Date() }).returning();
+    await db.insert(environmentLeases).values({ companyId, environmentId, heartbeatRunId: run.id, provider: "ssh",
+      providerLeaseId: randomUUID(), leasePolicy: "ephemeral", status: "released", cleanupStatus: "success",
+      releasedAt: new Date(), metadata: { driver: "ssh" } });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+  });
   async function recoveredWorkspaceCleanup() {
     const [agent] = await db.insert(agents).values({ companyId, name: "Stopped workspace owner" }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",

@@ -5994,7 +5994,7 @@ export function agentRoutes(
     }
     const now = new Date();
     const [updated] = await db.update(environmentLeases).set({
-      ...(terminal ? {} : { status: "released", releasedAt: now }),
+      ...(terminal ? {} : { status: "released", releasedAt: now, cleanupStatus: "success", failureReason: null }),
       metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ operatorStopAttestation: attestation })}::jsonb`,
       updatedAt: now,
     }).where(and(
