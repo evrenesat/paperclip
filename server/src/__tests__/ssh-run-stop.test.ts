@@ -95,6 +95,16 @@ describe("ssh run-scoped stop script", () => {
       }
     }
   }, 20_000);
+
+  it("fails instead of reporting a clean stop when the remote has no proc filesystem", async () => {
+    const result = await runScript({
+      ...process.env,
+      PAPERCLIP_STOP_RUN_ID: "run-anything",
+      PAPERCLIP_STOP_PROC_ROOT: `/nonexistent-${randomUUID()}`,
+    });
+    expect(result.code).toBe(4);
+    expect(result.stdout).not.toContain("paperclip-ssh-run-stop matched=");
+  });
 });
 
 describeEmbeddedPostgres("SSH lease release stops remote work", () => {
@@ -221,6 +231,16 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
       cleanupStatus: "failed",
       failureReason: "ssh_remote_stop_failed",
     });
+  });
+
+  it("releases a normally completed run without stopping its remote processes", async () => {
+    const { runId, leaseId } = await seedLease();
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    expect(await environmentRuntimeService(db).releaseRunLeases(runId, "released")).toHaveLength(1);
+    expect(runner).not.toHaveBeenCalled();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "released" });
   });
 
   it("does not repeat the remote stop when the lease already carries its receipt", async () => {
