@@ -1331,12 +1331,14 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
 
     async retryPendingSandboxTeardown({ environment, lease }) {
       if (!lease.heartbeatRunId) throw new Error("SSH lease cleanup requires its run id.");
-      await stopSshRunProcesses(db, {
-        companyId: lease.companyId,
-        runId: lease.heartbeatRunId,
-        lease,
-        environment,
-      });
+      if (!hasBoundRemoteStopReceipt(lease)) {
+        await stopSshRunProcesses(db, {
+          companyId: lease.companyId,
+          runId: lease.heartbeatRunId,
+          lease,
+          environment,
+        });
+      }
       if (!lease.providerLeaseId) throw new Error("SSH lease cleanup lost its provider lease id.");
       return { providerLeaseId: lease.providerLeaseId, state: "stopped" as const };
     },
