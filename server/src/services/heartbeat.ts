@@ -336,6 +336,7 @@ import { resumePauseInterruptedWork } from "./issue-tree-resume.js";
 import {
   adapterExecutionControls,
   createAdapterExecutionControl,
+  registerAdapterExecutionControl,
 } from "./adapter-execution-control.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
@@ -2207,6 +2208,10 @@ export function heartbeatService(
     let identityRedactor = createAgentIdentityRedactor();
 
     try {
+      // Publish adapter ownership before workspace realization. A Stop that
+      // lands during preparation then aborts this execution instead of waiting
+      // for a control that is only registered when dispatch begins.
+      await registerAdapterExecutionControl(run.id, executionControl);
       const loadedAgent = await timePreparation("agent_read", () => getAgent(run.agentId));
       if (!loadedAgent) {
         await setRunStatus(runId, "failed", {
@@ -3017,6 +3022,9 @@ export function heartbeatService(
         else delete runtimeConfig.workspaceStrategy;
         preparedSession = await prepareSession();
         preparedWorkspace = await prepareWorkspace();
+      }
+      if (executionControl.controller.signal.aborted) {
+        throw new Error("Run stopped before provider startup");
       }
       const {
         persistedRunnerProfile,

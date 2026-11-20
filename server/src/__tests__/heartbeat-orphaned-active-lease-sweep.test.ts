@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activityLog,
   costEvents,
   agents,
   companies,
@@ -40,6 +41,11 @@ import { logger } from "../middleware/logger.ts";
 import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/heartbeat.ts";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { nativeWorkspaceExportPendingForLease } from "../services/native-runtime/native-workspace-finalization-state.js";
+import { setSshRunStopRunnerForTests } from "../services/ssh-run-stop.js";
+import {
+  adapterExecutionControls,
+  createAdapterExecutionControl,
+} from "../services/adapter-execution-control.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -67,8 +73,11 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
   });
 
   afterEach(async () => {
+    setSshRunStopRunnerForTests(null);
+    adapterExecutionControls.clear();
     await db.delete(environmentLeases);
     await db.delete(costEvents);
+    await db.delete(activityLog);
     await db.delete(heartbeatRuns);
     await db.delete(environments);
     await db.delete(agents);
@@ -642,4 +651,103 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
       selectSpy.mockRestore();
     }
   });
+
+  async function seedTerminalSshLease(input: {
+    status?: string;
+    controllerBootId?: string | null;
+    controllerLeaseExpiresAt?: Date | null;
+    metadata?: Record<string, unknown>;
+  } = {}) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const environmentId = randomUUID();
+    const runId = randomUUID();
+    const leaseId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "SshCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(environments).values({
+      id: environmentId,
+      name: `SSH fixture ${environmentId}`,
+      driver: "ssh",
+      status: "active",
+      config: { host: "ssh.example.test", username: "fixture", remoteWorkspacePath: "/workspace", useHostAuth: true },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: input.status ?? "cancelled",
+      runtimeMode: "legacy",
+      nextEventSeq: 1,
+      controllerBootId: input.controllerBootId === undefined ? randomUUID() : input.controllerBootId,
+      controllerLeaseExpiresAt: input.controllerLeaseExpiresAt === undefined ? oldEnough() : input.controllerLeaseExpiresAt,
+    });
+    await db.insert(environmentLeases).values({
+      id: leaseId,
+      companyId,
+      environmentId,
+      heartbeatRunId: runId,
+      status: "active",
+      leasePolicy: "ephemeral",
+      provider: "ssh",
+      providerLeaseId: "ssh://ssh.example.test/workspace",
+      metadata: input.metadata ?? {},
+      updatedAt: oldEnough(),
+    });
+    return { companyId, agentId, environmentId, runId, leaseId };
+  }
+
+  it("stops the remote work of another boot's cancelled SSH run", async () => {
+    const { runId, leaseId } = await seedTerminalSshLease();
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ recovered: 1 });
+    expect(runner).toHaveBeenCalledOnce();
+    expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
+    expect((await leaseRow(leaseId))?.metadata?.remoteExecutionTermination).toMatchObject({
+      runId, leaseId, provider: "ssh", state: "stopped",
+    });
+  });
+
+  it("leaves the SSH lease to this boot while the run is still in process", async () => {
+    const { runId, leaseId } = await seedTerminalSshLease();
+    adapterExecutionControls.set(runId, createAdapterExecutionControl());
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    expect(await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 0 });
+    expect(runner).not.toHaveBeenCalled();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "active" });
+  });
+
+  it("skips an SSH lease whose run is still non-terminal", async () => {
+    const { leaseId } = await seedTerminalSshLease({ status: "running" });
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    expect(await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 0 });
+    expect(runner).not.toHaveBeenCalled();
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "active" });
+  });
+
 });

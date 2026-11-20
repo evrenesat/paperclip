@@ -886,8 +886,20 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       const guardedDispatch =
         await dispatchWithTiming(
           (markDispatchStarted) => {
-            input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            return (async () => {
+              // Realization can outlive registration. Re-check the durable run
+              // and the Stop signal at the last boundary before the adapter is
+              // invoked, so a cancelled run never starts provider work.
+              const current = await getRun(run.id);
+              if (
+                !current ||
+                isHeartbeatRunTerminalStatus(current.status) ||
+                executionControl.controller.signal.aborted
+              ) {
+                throw new Error("Run stopped before provider startup");
+              }
+              input.effects.onLegacyAdapterEntered();
+              return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,
               agentIdentity,
               observability,
@@ -969,6 +981,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               },
               authToken: authToken ?? undefined,
             }));
+            })();
           },
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
