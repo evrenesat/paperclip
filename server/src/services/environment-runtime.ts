@@ -35,7 +35,8 @@ import type { NativeWorkspaceFinalizationOwnership } from "./native-runtime/nati
 import { acceptedStopOnlyReceipt, hasStopOnlyCleanup, prepareSandboxStopAndRetain, readStopOnlyCleanup, SANDBOX_ALLOCATION_HOLDER_STATUSES, SANDBOX_STOP_AND_RETAIN_KEY, settleStopOnlyCleanup, stopOnlyCleanupKey } from "./sandbox-stop-and-retain.js";
 import { JsonRpcCallError, readEnvironmentAcquisitionDiagnostic, readEnvironmentCreationCleanupError } from "@paperclipai/plugin-sdk";
 import { preserveEnvironmentSyncOutErrorDiagnostic } from "./environment-sync-out-error.js";
-import { remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasBoundRemoteStopReceipt, remoteTerminationReceipt } from "./remote-execution-termination.js";
+import { sshRunStopFailure, stopSshRunProcesses } from "./ssh-run-stop.js";
 import { inspectCloudSandboxCleanupAbsence } from "./sandbox-absence-proof.js";
 import { hasNativeWorkspaceExportResume, releaseCompletedNativeWorkspaceExportRetention } from "./native-runtime/native-workspace-export-resume.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -1279,7 +1280,65 @@ function createSshEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
     },
 
     async releaseRunLease(input) {
-      return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      // A normal success still pays for one SSH round trip per turn with no
+      // work to stop, so only a cancelled (`expired`), failed, or explicit
+      // cancel releases through the remote-stop path.
+      const stopRemote = input.status === "expired" || input.status === "failed" ||
+        input.cancelActiveWork === true;
+      if (!stopRemote) {
+        return await environmentsSvc.releaseLease(input.lease.id, input.status);
+      }
+      const current = await environmentsSvc.getLeaseById(input.lease.id);
+      if (!current) return null;
+      if (hasBoundRemoteStopReceipt(current)) {
+        return await environmentsSvc.releaseLease(current.id, input.status, {
+          cleanupStatus: "success",
+          remoteExecutionTermination:
+            current.metadata?.remoteExecutionTermination as Record<string, unknown> | undefined,
+        });
+      }
+      // The cleanup sweep owns a missing proof; retrying here could race a
+      // teardown that is already in flight.
+      if (current.status !== "active") return null;
+      const runId = current.heartbeatRunId;
+      if (!runId) return null;
+      try {
+        await stopSshRunProcesses(db, {
+          companyId: current.companyId,
+          runId,
+          lease: current,
+          environment: input.environment,
+        });
+        const receipt = remoteTerminationReceipt(current, {
+          providerLeaseId: current.providerLeaseId,
+          state: "stopped",
+        });
+        if (!receipt) throw sshRunStopFailure("SSH lease cannot record a remote stop receipt.");
+        return await environmentsSvc.releaseLease(current.id, input.status, {
+          cleanupStatus: "success",
+          remoteExecutionTermination: receipt,
+        });
+      } catch {
+        // Never report a kill that was not proven. The pending cleanup sweep
+        // retries the remote stop and records the proof once it succeeds.
+        await environmentsSvc.releaseLease(current.id, "pending_cleanup", {
+          cleanupStatus: "failed",
+          failureReason: "ssh_remote_stop_failed",
+        });
+        return null;
+      }
+    },
+
+    async retryPendingSandboxTeardown({ environment, lease }) {
+      if (!lease.heartbeatRunId) throw new Error("SSH lease cleanup requires its run id.");
+      await stopSshRunProcesses(db, {
+        companyId: lease.companyId,
+        runId: lease.heartbeatRunId,
+        lease,
+        environment,
+      });
+      if (!lease.providerLeaseId) throw new Error("SSH lease cleanup lost its provider lease id.");
+      return { providerLeaseId: lease.providerLeaseId, state: "stopped" as const };
     },
 
     async realizeWorkspace(input) {

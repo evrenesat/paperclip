@@ -1688,10 +1688,18 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     const [run] = await db.select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId,
       status: heartbeatRuns.status, error: heartbeatRuns.error, runtimeMode: heartbeatRuns.runtimeMode,
+      controllerBootId: heartbeatRuns.controllerBootId,
       controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, lease.heartbeatRunId), eq(heartbeatRuns.companyId, lease.companyId)));
     if (!run || !HEARTBEAT_RUN_TERMINAL_STATUSES.some(status => status === run.status)) return false;
-    if (!deferral && !(run.runtimeMode === "native" && run.status === "cancelled")) return false;
+    // A terminal native cancelled run already qualifies. An SSH lease of any
+    // terminal run is the other stranded case: its cancel or crash never wrote
+    // a provider receipt, so the remote work may still be running. This boot
+    // still owns the in-process release retries; only another boot (or a
+    // restart) may settle it here.
+    const strandedSshLease = !deferral && lease.provider === "ssh";
+    if (!deferral && !(run.runtimeMode === "native" && run.status === "cancelled") && !strandedSshLease) return false;
+    if (strandedSshLease && run.controllerBootId === legacyControllerBootId) return false;
     const [owner] = await db.select({ leaseOwner: nativeRunFinalizations.leaseOwner, leaseExpiresAt: nativeRunFinalizations.leaseExpiresAt })
       .from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId, run.id), eq(nativeRunFinalizations.companyId, run.companyId)));
     const heldUntil = Math.max(run.controllerLeaseExpiresAt?.getTime() ?? 0,

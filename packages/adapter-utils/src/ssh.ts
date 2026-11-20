@@ -1495,9 +1495,18 @@ export async function runSshCommand(
       'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
-      envArgs.length > 0
-        ? `exec env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-        : `exec sh -c ${shellQuote(remoteCommand)}`,
+      // A run-scoped stop signals the process group, so the remote command must
+      // lead its own session. Without a leader the SSH connection's group could
+      // include an unrelated command; `setsid` is optional on minimal hosts.
+      `if command -v setsid >/dev/null 2>&1; then exec setsid ${
+        envArgs.length > 0
+          ? `env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
+          : `sh -c ${shellQuote(remoteCommand)}`
+      }; else exec ${
+        envArgs.length > 0
+          ? `env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
+          : `sh -c ${shellQuote(remoteCommand)}`
+      }; fi`,
     ].join(" && ");
 
     sshArgs.push(
@@ -1556,9 +1565,17 @@ export async function buildSshSpawnTarget(input: {
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
     `cd ${shellQuote(input.spec.remoteCwd)}`,
-    envArgs.length > 0
-      ? `exec env ${envArgs.join(" ")} ${remoteCommandParts}`
-      : `exec ${remoteCommandParts}`,
+    // Lead a new session so a run-scoped stop can signal exactly this command's
+    // process group. Fall back to the old exec when the host lacks `setsid`.
+    `if command -v setsid >/dev/null 2>&1; then exec setsid ${
+      envArgs.length > 0
+        ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
+        : remoteCommandParts
+    }; else exec ${
+      envArgs.length > 0
+        ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
+        : remoteCommandParts
+    }; fi`,
   ].join(" && ");
 
   sshArgs.push(
