@@ -42,6 +42,7 @@ import { heartbeatService, type HeartbeatEnvironmentRuntime } from "../services/
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { nativeWorkspaceExportPendingForLease } from "../services/native-runtime/native-workspace-finalization-state.js";
 import { setSshRunStopRunnerForTests } from "../services/ssh-run-stop.js";
+import { legacyControllerBootId } from "../services/legacy-controller-lease.js";
 import {
   adapterExecutionControls,
   createAdapterExecutionControl,
@@ -738,6 +739,20 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     expect(await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 0 });
     expect(runner).not.toHaveBeenCalled();
     expect(await leaseRow(leaseId)).toMatchObject({ status: "active" });
+  });
+
+  it("does not race this boot's own release of an SSH run", async () => {
+    const { leaseId } = await seedTerminalSshLease({ controllerBootId: legacyControllerBootId });
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+    expect(runner).not.toHaveBeenCalled();
+    expect(await leaseRow(leaseId)).toMatchObject({
+      status: "pending_cleanup",
+      failureReason: "orphaned_active_lease_recovered",
+    });
   });
 
   it("skips an SSH lease whose run is still non-terminal", async () => {

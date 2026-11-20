@@ -13,13 +13,14 @@ vi.mock("node:child_process", async (importOriginal) => {
       return actual.execFile("sh", ["-c", args.at(-1)!], options, callback);
     }),
     spawn: vi.fn((file: string, args: string[], options: Parameters<typeof actual.spawn>[2]) => {
-      if (file !== "ssh") throw new Error(`Unexpected subprocess ${file}`);
+      if (path.basename(file) !== "ssh") throw new Error(`Unexpected subprocess ${file}`);
       return actual.spawn("sh", ["-c", args.at(-1)!], options);
     }),
   };
 });
 
 import { createSshCommandManagedRuntimeRunner, runSshCommand } from "./ssh.js";
+import { runChildProcess } from "./server-utils.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -58,6 +59,30 @@ describe("SSH command-managed argv", () => {
     const [runId, sid] = result.stdout.trim().split(/\s+/);
     expect(runId).toBe("run-fixture");
     expect(Number(sid)).toBeGreaterThan(0);
+  });
+
+  it("forwards a dispatch run id into the remote launch environment", async () => {
+    const cwd = await mkdtemp(path.join(os.tmpdir(), "ssh-dispatch-env-"));
+    roots.push(cwd);
+    const result = await runChildProcess("run-dispatch", "printenv", ["PAPERCLIP_RUN_ID"], {
+      cwd,
+      env: { PAPERCLIP_RUN_ID: "run-dispatch" },
+      timeoutSec: 5,
+      graceSec: 1,
+      onLog: async () => {},
+      remoteExecution: {
+        host: "fixture.invalid",
+        username: "fixture",
+        port: 22,
+        remoteCwd: cwd,
+        remoteWorkspacePath: cwd,
+        privateKey: null,
+        knownHosts: null,
+        strictHostKeyChecking: true,
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    expect(result.stdout.trim()).toBe("run-dispatch");
   });
 
   it("delivers configured credentials without placing them in SSH process arguments and preserves provider stdin", async () => {
