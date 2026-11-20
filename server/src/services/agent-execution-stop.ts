@@ -4,7 +4,7 @@ import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasOperatorStopAttestation, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
@@ -43,9 +43,18 @@ export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Pro
     if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return "run_not_terminal";
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return "run_controller_lease_held";
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
-    if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return "remote_stop_unconfirmed";
-      continue;
+    const remoteLeases = runLeases.filter(lease => lease.provider && lease.provider !== "local");
+    if (remoteLeases.length) {
+      const unfinished = remoteLeases.filter(lease =>
+        !hasRemoteTerminationReceipt(lease) && !hasOperatorStopAttestation(lease));
+      if (run.status !== "cancelled" || !unfinished.length) continue;
+      // An SSH release is a database write and never produces a provider
+      // receipt. When every unfinished lease is SSH and the run recorded the
+      // local client process it started, fall through to the process checks:
+      // an absent process (with start-time reuse protection) is the stop
+      // proof. A null pid carries no evidence and must keep blocking.
+      if (!unfinished.every(lease => lease.provider === "ssh") ||
+          (!run.processPid && !run.processGroupId)) return "remote_stop_unconfirmed";
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));

@@ -20,6 +20,7 @@ import { PLUGIN_RUNNER_AI_CONNECTION_REQUIRED, pluginEnvironmentRunnerTaskDriver
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { qualifyAgentRunner } from "../services/agent-runner-qualification.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
+import { operatorStopAttestation } from "../services/remote-execution-termination.js";
 import { isAgentSetupDraft } from "../modules/agent-lifecycle/index.js";
 
 import { agentIdentityService } from "../services/agent-identity.js";
@@ -71,7 +72,7 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import { activityLog, agents as agentsTable, chatConversations, companies, environmentLeases, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
@@ -5927,6 +5928,92 @@ export function agentRoutes(
       agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
       action: "agent.lifecycle_retried", entityType: "agent", entityId: agent.id });
     res.json(redactAgentRowForResponse(agent));
+  });
+
+  // An SSH lease release is a database write, so it can never carry a provider
+  // stop receipt. A board operator records here that the cancelled run's remote
+  // work stopped; the pause blocker accepts this evidence for SSH leases only.
+  router.post("/agents/:id/lifecycle/record-remote-termination", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    const existing = await getAccessibleAgent(req, res, id);
+    if (!existing) return;
+    await assertCanConfigureAgentSetup(req, existing);
+    const body = req.body as { runId?: unknown; leaseId?: unknown; note?: unknown };
+    const runId = typeof body.runId === "string" ? body.runId : "";
+    const leaseId = typeof body.leaseId === "string" ? body.leaseId : "";
+    const note = typeof body.note === "string" ? body.note.trim() : "";
+    if (!runId || !leaseId || !note || note.length > 1000) {
+      res.status(400).json({ error: "runId, leaseId and a note of at most 1000 characters are required" });
+      return;
+    }
+    const [run] = await db.select().from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, existing.companyId))).limit(1);
+    if (!run || run.agentId !== existing.id) {
+      res.status(404).json({ error: "Run not found for this agent" });
+      return;
+    }
+    if (run.status !== "cancelled") {
+      res.status(409).json({ error: "Only a cancelled run can be recorded as remotely stopped" });
+      return;
+    }
+    const [lease] = await db.select().from(environmentLeases)
+      .where(and(eq(environmentLeases.id, leaseId), eq(environmentLeases.companyId, existing.companyId))).limit(1);
+    if (!lease || lease.heartbeatRunId !== run.id) {
+      res.status(404).json({ error: "Lease not found for this run" });
+      return;
+    }
+    if (lease.provider !== "ssh") {
+      res.status(409).json({ error: "Only an SSH lease can be recorded as remotely stopped" });
+      return;
+    }
+    const terminal = Boolean(lease.releasedAt && ["released", "expired", "failed"].includes(lease.status));
+    if (!terminal && lease.status !== "pending_cleanup") {
+      res.status(409).json({ error: "Lease release has not started; stop the remote work first" });
+      return;
+    }
+    const stored = (lease.metadata as Record<string, unknown> | null)?.operatorStopAttestation;
+    const storedAttestation = stored && typeof stored === "object"
+      ? stored as Record<string, unknown>
+      : null;
+    if (terminal && storedAttestation &&
+        storedAttestation.schema === "paperclip.operator-stop-attestation.v1" &&
+        storedAttestation.companyId === lease.companyId &&
+        storedAttestation.runId === run.id &&
+        storedAttestation.leaseId === lease.id) {
+      res.json({ lease, attestation: storedAttestation });
+      return;
+    }
+    const attestation = operatorStopAttestation(lease, {
+      attestedBy: req.actor.userId ?? "board",
+      note,
+    });
+    if (!attestation) {
+      res.status(409).json({ error: "Lease cannot carry an operator stop attestation" });
+      return;
+    }
+    const now = new Date();
+    const [updated] = await db.update(environmentLeases).set({
+      ...(terminal ? {} : { status: "released", releasedAt: now }),
+      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ operatorStopAttestation: attestation })}::jsonb`,
+      updatedAt: now,
+    }).where(and(
+      eq(environmentLeases.id, lease.id),
+      eq(environmentLeases.companyId, existing.companyId),
+      eq(environmentLeases.heartbeatRunId, run.id),
+      eq(environmentLeases.provider, "ssh"),
+      terminal ? inArray(environmentLeases.status, ["released", "expired", "failed"]) : eq(environmentLeases.status, "pending_cleanup"),
+    )).returning();
+    if (!updated) {
+      res.status(409).json({ error: "Lease changed while recording termination; reload and retry" });
+      return;
+    }
+    const actor = getActorInfo(req);
+    await logActivity(db, { companyId: existing.companyId, actorType: actor.actorType, actorId: actor.actorId,
+      agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+      action: "agent.remote_termination_attested", entityType: "agent", entityId: existing.id,
+      details: { runId: run.id, leaseId: lease.id } });
+    res.json({ lease: updated, attestation });
   });
 
   router.post("/agents/:id/pause", async (req, res) => {

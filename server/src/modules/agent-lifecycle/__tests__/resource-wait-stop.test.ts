@@ -6,12 +6,12 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { resolveExternalTestDatabaseUrl } from "../../../__tests__/helpers/external-test-database.js";
 import { createAgentLifecycle, configureAgentLifecycle } from "../../../services/agent-lifecycle.js";
 import { createLifecycleDriver } from "../../../services/agent-lifecycle-driver.js";
-import { agentExecutionsHaveStopped } from "../../../services/agent-execution-stop.js";
+import { agentExecutionsHaveStopped, agentExecutionStopBlocker } from "../../../services/agent-execution-stop.js";
 import { canRetryStoppedRun } from "../../../services/cancelled-native-startup.js";
 import { legacyExecutionNeedsReconciliation } from "../../../services/legacy-execution-recovery.js";
 import { legacyControllerBootId } from "../../../services/legacy-controller-lease.js";
 import { PROCESS_START_REQUESTED } from "../../../services/native-local-process-stop.js";
-import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
+import { hasRemoteTerminationReceipt, operatorStopAttestation, remoteExecutionHasStopped, remoteTerminationReceipt, stoppedRemoteCleanupScopes } from "../../../services/remote-execution-termination.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_AGENT_LIFECYCLE_TEST_DATABASE_URL");
 const support = external ? { supported: true } : await getEmbeddedPostgresTestSupport();
@@ -130,6 +130,85 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       remoteTerminationReceipt(lease, { providerLeaseId: lease.providerLeaseId, state: "stopped" }) } }).where(eq(environmentLeases.id, lease.id));
     expect(await canRetryStoppedRun(db, run)).toBe(true);
     expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+  });
+
+  it("keeps blocking a released sandbox lease without a provider stop receipt", async () => {
+    const { agent, run } = await fixture();
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "e2b", providerLeaseId: "sandbox-1", status: "released", releasedAt: new Date(0), cleanupStatus: "success" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("remote_stop_unconfirmed");
+  });
+
+  it("keeps blocking a cancelled SSH run whose recorded client process is still alive", async () => {
+    const { agent, run } = await fixture();
+    await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(0), cleanupStatus: "success" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("run_process_alive");
+  });
+
+  it("keeps blocking a cancelled SSH run that never recorded a process", async () => {
+    const { agent, run } = await fixture();
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(0), cleanupStatus: "success" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("remote_stop_unconfirmed");
+  });
+
+  it("finishes a cancelled SSH run after its recorded client process is gone", async () => {
+    const { agent, run } = await fixture();
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "expired", releasedAt: new Date(0), cleanupStatus: "success" });
+    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(true);
+  });
+
+  it("reports a released lease while its run is still non-terminal", async () => {
+    const { agent, run } = await fixture();
+    await db.update(heartbeatRuns).set({ status: "running", finishedAt: null }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(0), cleanupStatus: "success" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("run_not_terminal");
+  });
+
+  it("ignores an attestation bound to another lease", async () => {
+    const { agent, run } = await fixture();
+    const [lease] = await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(0), cleanupStatus: "success" }).returning();
+    const attestation = operatorStopAttestation({ ...lease, id: randomUUID() }, { attestedBy: "board", note: "checked" });
+    await db.update(environmentLeases).set({ metadata: { operatorStopAttestation: attestation } })
+      .where(eq(environmentLeases.id, lease.id));
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("remote_stop_unconfirmed");
+  });
+
+  it("accepts a bound operator attestation for an SSH lease without claiming a provider receipt", async () => {
+    const { agent, run } = await fixture();
+    const [lease] = await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(0), cleanupStatus: "success" }).returning();
+    const attestation = operatorStopAttestation(lease, { attestedBy: "board", note: "client gone" });
+    await db.update(environmentLeases).set({ metadata: { operatorStopAttestation: attestation } })
+      .where(eq(environmentLeases.id, lease.id));
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    const [stored] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    expect(hasRemoteTerminationReceipt(stored!)).toBe(false);
+    expect(await remoteExecutionHasStopped(db, run.companyId, run.id)).toBe(false);
+    expect(await stoppedRemoteCleanupScopes(db, run.companyId, run.id)).toBeNull();
+  });
+
+  it("finishes a pause whose history holds an expired receipt-less SSH lease", async () => {
+    const { agent, run } = await fixture();
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, run.id));
+    await db.insert(environmentLeases).values({ companyId: run.companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "expired", releasedAt: new Date(0), cleanupStatus: "success" });
+    const work = configureAgentLifecycle(db, {
+      requiredPluginIds: async () => [], runPlugin: async () => "complete",
+      runHost: createLifecycleDriver(db, {} as never).runHost,
+    });
+    try {
+      await createAgentLifecycle(db).pauseAgent(agent.id);
+      await work.process(agent.id);
+      expect((await db.select().from(agents).where(eq(agents.id, agent.id)))[0]).toMatchObject({
+        status: "paused", lifecycleState: "paused", lifecycleHolds: ["manual"] });
+    } finally { await work.stop(); }
   });
 
   it("does not mistake an unproven HTTP dispatch for a resource wait", async () => {

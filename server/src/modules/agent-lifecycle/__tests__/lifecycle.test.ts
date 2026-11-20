@@ -6,7 +6,7 @@ import { createAgentLifecycleEffects } from "../../../services/agent-lifecycle.j
 import { deleteCompany } from "../../../services/company-deletion.js";
 import { agentLifecycleCompanyDeletion } from "../company-deletion.js";
 import { requireServerAdapter } from "../../../adapters/index.js";
-import { agentExecutionsHaveStopped } from "../../../services/agent-execution-stop.js";
+import { agentExecutionsHaveStopped, agentExecutionStopBlocker } from "../../../services/agent-execution-stop.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
@@ -1146,6 +1146,82 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await request(app({ type: "agent", source: "agent_key", companyId, agentId: agent.id })).post(url).send({}).expect(403);
     const denied = await request(app({ ...board, companyIds: [], memberships: [] })).post(url).send({});
     expect([403, 404]).toContain(denied.status);
+  });
+
+  it("records an operator-verified remote termination for a cancelled SSH run", async () => {
+    const agent = await hire();
+    function app(actor: Express.Request["actor"]) {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = actor; next(); });
+      app.use("/api", agentRoutes(db)); app.use(errorHandler); return app;
+    }
+    const board: Express.Request["actor"] = { type: "board", source: "session", userId: "board", companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "admin", status: "active" }] };
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board", membershipRole: "admin" });
+    await db.insert(principalPermissionGrants).values(["agents:create", "agents:configure"].map(permissionKey => ({ companyId, principalType: "user", principalId: "board", permissionKey })));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(), cleanupStatus: "success" }).returning();
+    const url = `/api/agents/${agent.id}/lifecycle/record-remote-termination`;
+    const first = await request(app(board)).post(url).send({ runId: run.id, leaseId: lease.id, note: "client process gone" });
+    expect(first.status, JSON.stringify(first.body)).toBe(200);
+    expect(first.body.attestation).toMatchObject({ schema: "paperclip.operator-stop-attestation.v1",
+      companyId, runId: run.id, leaseId: lease.id, provider: "ssh", byUserId: "board", note: "client process gone" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: lease.id, note: "client process gone" }).expect(200);
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.entityId, agent.id), eq(activityLog.action, "agent.remote_termination_attested"))))
+      .toEqual([expect.objectContaining({ actorType: "user", actorId: "board" })]);
+    await request(app({ type: "agent", source: "agent_key", companyId, agentId: agent.id })).post(url)
+      .send({ runId: run.id, leaseId: lease.id, note: "self" }).expect(403);
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: lease.id }).expect(400);
+
+    const [otherCompany] = await db.insert(companies).values({ name: "Other", issuePrefix: `O${randomUUID().slice(0, 7)}` }).returning();
+    const [otherAgent] = await db.insert(agents).values({ companyId: otherCompany.id, name: "Other agent", adapterType: "process" }).returning();
+    const cross = await request(app(board)).post(`/api/agents/${otherAgent.id}/lifecycle/record-remote-termination`)
+      .send({ runId: run.id, leaseId: lease.id, note: "cross" });
+    expect([403, 404]).toContain(cross.status);
+
+    const [activeRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "running",
+      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date() }).returning();
+    const [activeLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: activeRun.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "released", releasedAt: new Date(), cleanupStatus: "success" }).returning();
+    await request(app(board)).post(url).send({ runId: activeRun.id, leaseId: activeLease.id, note: "early" }).expect(409);
+
+    const [sandboxLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "e2b", providerLeaseId: "sandbox-1", status: "released", releasedAt: new Date(), cleanupStatus: "success" }).returning();
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: sandboxLease.id, note: "wrong provider" }).expect(409);
+  });
+
+  it("releases a stuck SSH pending_cleanup lease with an attestation but never clears a failed cleanup", async () => {
+    const agent = await hire();
+    function app(actor: Express.Request["actor"]) {
+      const app = express(); app.use(express.json());
+      app.use((req, _res, next) => { req.actor = actor; next(); });
+      app.use("/api", agentRoutes(db)); app.use(errorHandler); return app;
+    }
+    const board: Express.Request["actor"] = { type: "board", source: "session", userId: "board", companyIds: [companyId],
+      memberships: [{ companyId, membershipRole: "admin", status: "active" }] };
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "board", membershipRole: "admin" });
+    await db.insert(principalPermissionGrants).values(["agents:create", "agents:configure"].map(permissionKey => ({ companyId, principalType: "user", principalId: "board", permissionKey })));
+    const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
+      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() }).returning();
+    const [lease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "pending_cleanup", cleanupStatus: "success" }).returning();
+    const url = `/api/agents/${agent.id}/lifecycle/record-remote-termination`;
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: lease.id, note: "cleanup could not run" }).expect(200);
+    const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
+    expect(released).toMatchObject({ status: "released", cleanupStatus: "success" });
+    expect(released!.releasedAt).toBeInstanceOf(Date);
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+
+    const [failedLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir-2", status: "pending_cleanup", cleanupStatus: "failed" }).returning();
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: failedLease.id, note: "still failing" }).expect(200);
+    const [failed] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, failedLease.id));
+    expect(failed).toMatchObject({ status: "released", cleanupStatus: "failed" });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
   });
 
   it("recovers an expired lease and never accepts an expired completion", async () => {

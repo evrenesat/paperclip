@@ -29,6 +29,37 @@ type ReceiptLease = LeaseIdentity & {
   metadata: Record<string, unknown> | null;
 };
 
+/** An SSH lease can never produce a provider stop receipt: its release is a
+ * pure database write. A board operator may attest that the SSH client driving
+ * the cancelled run is gone. The attestation is bound to the exact company,
+ * run, lease and provider, and only counts on an already-released lease. */
+export function operatorStopAttestation(
+  lease: LeaseIdentity,
+  input: { attestedBy: string; note: string },
+) {
+  if (!lease.heartbeatRunId || lease.provider !== "ssh" || !lease.providerLeaseId) return undefined;
+  return {
+    schema: "paperclip.operator-stop-attestation.v1",
+    companyId: lease.companyId, runId: lease.heartbeatRunId, leaseId: lease.id,
+    provider: lease.provider, providerLeaseId: lease.providerLeaseId,
+    byUserId: input.attestedBy, note: input.note.trim(),
+    at: new Date().toISOString(),
+  };
+}
+
+/** A board operator attested that the remote work of this cancelled SSH run
+ * stopped, after the lease was released without a provider receipt. */
+export function hasOperatorStopAttestation(lease: ReceiptLease): boolean {
+  const attestation = lease.metadata?.operatorStopAttestation as Record<string, unknown> | undefined;
+  return Boolean(attestation && attestation.schema === "paperclip.operator-stop-attestation.v1" &&
+    attestation.companyId === lease.companyId && attestation.runId === lease.heartbeatRunId &&
+    attestation.leaseId === lease.id && attestation.provider === lease.provider &&
+    attestation.providerLeaseId === lease.providerLeaseId && attestation.provider === "ssh" &&
+    typeof attestation.byUserId === "string" && attestation.byUserId.length > 0 &&
+    typeof attestation.note === "string" && attestation.note.length > 0 &&
+    lease.releasedAt && ["released", "expired", "failed"].includes(lease.status));
+}
+
 /** The lease carries a provider stop receipt bound to its exact company, run,
  * lease, provider and physical task. It proves execution there stopped, not
  * that the lease's resources were released. */
