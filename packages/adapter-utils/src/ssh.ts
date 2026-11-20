@@ -1490,23 +1490,20 @@ export async function runSshCommand(
     // directly when no .bash_profile exists, so a host that adds nvm in
     // .bashrc still resolves node without a double-run of the setup.
     const envArgs = envEntries.map(([key, value]) => `${key}=${shellQuote(value)}`);
+    const remoteInvocation = envArgs.length > 0
+      ? `env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
+      : `sh -c ${shellQuote(remoteCommand)}`;
     const remoteScript = [
       'if [ -f /etc/profile ]; then . /etc/profile >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.profile" ]; then . "$HOME/.profile" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
       'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
       // A run-scoped stop signals the process group, so the remote command must
-      // lead its own session. Without a leader the SSH connection's group could
-      // include an unrelated command; `setsid` is optional on minimal hosts.
-      `if command -v setsid >/dev/null 2>&1; then exec setsid ${
-        envArgs.length > 0
-          ? `env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-          : `sh -c ${shellQuote(remoteCommand)}`
-      }; else exec ${
-        envArgs.length > 0
-          ? `env ${envArgs.join(" ")} sh -c ${shellQuote(remoteCommand)}`
-          : `sh -c ${shellQuote(remoteCommand)}`
-      }; fi`,
+      // lead its own session. sshd already makes the command shell a session
+      // leader; `setsid` without `-w` would fork there, report its own success,
+      // and close stdin. Wait for the child when the host supports `setsid -w`;
+      // otherwise exec directly in the leader the SSH server already made.
+      `if command -v setsid >/dev/null 2>&1 && setsid -w true >/dev/null 2>&1; then exec setsid -w ${remoteInvocation}; else exec ${remoteInvocation}; fi`,
     ].join(" && ");
 
     sshArgs.push(
@@ -1548,6 +1545,9 @@ export async function buildSshSpawnTarget(input: {
     .filter((entry): entry is [string, string] => typeof entry[1] === "string")
     .map(([key, value]) => `${key}=${shellQuote(value)}`);
   const remoteCommandParts = [shellQuote(input.command), ...input.args.map((arg) => shellQuote(arg))].join(" ");
+  const remoteInvocation = envArgs.length > 0
+    ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
+    : remoteCommandParts;
   // Source the login profiles first, then run `env KEY=VAL cmd` so
   // user-supplied identity overrides win over anything a profile re-exports.
   // The SSH target is an operator-configured host, not a Paperclip sandbox
@@ -1565,17 +1565,10 @@ export async function buildSshSpawnTarget(input: {
     'if [ -f "$HOME/.bash_profile" ]; then . "$HOME/.bash_profile" >/dev/null 2>&1 || true; elif [ -f "$HOME/.bashrc" ]; then . "$HOME/.bashrc" >/dev/null 2>&1 || true; fi',
     'if [ -f "$HOME/.zprofile" ]; then . "$HOME/.zprofile" >/dev/null 2>&1 || true; fi',
     `cd ${shellQuote(input.spec.remoteCwd)}`,
-    // Lead a new session so a run-scoped stop can signal exactly this command's
-    // process group. Fall back to the old exec when the host lacks `setsid`.
-    `if command -v setsid >/dev/null 2>&1; then exec setsid ${
-      envArgs.length > 0
-        ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
-        : remoteCommandParts
-    }; else exec ${
-      envArgs.length > 0
-        ? `env ${envArgs.join(" ")} ${remoteCommandParts}`
-        : remoteCommandParts
-    }; fi`,
+    // Lead a session for run-scoped group stops without forking away from sshd's
+    // channel: `setsid -w` waits and keeps stdin/exit status; without it, exec in
+    // the session leader sshd already created.
+    `if command -v setsid >/dev/null 2>&1 && setsid -w true >/dev/null 2>&1; then exec setsid -w ${remoteInvocation}; else exec ${remoteInvocation}; fi`,
   ].join(" && ");
 
   sshArgs.push(

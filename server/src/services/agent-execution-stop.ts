@@ -49,12 +49,10 @@ export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Pro
         !hasRemoteTerminationReceipt(lease) && !hasOperatorStopAttestation(lease));
       if (run.status !== "cancelled" || !unfinished.length) continue;
       // An SSH release is a database write and never produces a provider
-      // receipt. When every unfinished lease is SSH and the run recorded the
-      // local client process it started, fall through to the process checks:
-      // an absent process (with start-time reuse protection) is the stop
-      // proof. A null pid carries no evidence and must keep blocking.
-      if (!unfinished.every(lease => lease.provider === "ssh") ||
-          (!run.processPid && !run.processGroupId)) return "remote_stop_unconfirmed";
+      // receipt. The local SSH client exiting does not prove the remote
+      // command stopped, so only a bound receipt or operator attestation
+      // counts; the process checks below are about local execution only.
+      return "remote_stop_unconfirmed";
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));
