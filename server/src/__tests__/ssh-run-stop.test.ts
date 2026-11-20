@@ -1,5 +1,8 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -105,6 +108,23 @@ describe("ssh run-scoped stop script", () => {
     expect(result.code).toBe(4);
     expect(result.stdout).not.toContain("paperclip-ssh-run-stop matched=");
   });
+
+  it("fails when no other process environment is readable", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-proc-"));
+    try {
+      await mkdir(path.join(root, "self"));
+      await writeFile(path.join(root, "self", "environ"), "PAPERCLIP_RUN_ID=run-anything\0");
+      const result = await runScript({
+        ...process.env,
+        PAPERCLIP_STOP_RUN_ID: "run-anything",
+        PAPERCLIP_STOP_PROC_ROOT: root,
+      });
+      expect(result.code).toBe(5);
+      expect(result.stdout).not.toContain("paperclip-ssh-run-stop matched=");
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });
 
 describeEmbeddedPostgres("SSH lease release stops remote work", () => {
@@ -129,7 +149,7 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     await tempDb?.cleanup();
   });
 
-  async function seedLease(options: { metadata?: Record<string, unknown> } = {}) {
+  async function seedLease(options: { metadata?: Record<string, unknown>; status?: string } = {}) {
     const companyId = randomUUID();
     const agentId = randomUUID();
     const environmentId = randomUUID();
@@ -169,7 +189,7 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
       companyId,
       agentId,
       invocationSource: "on_demand",
-      status: "cancelled",
+      status: options.status ?? "cancelled",
       runtimeMode: "legacy",
       nextEventSeq: 1,
     });
@@ -234,13 +254,42 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
   });
 
   it("releases a normally completed run without stopping its remote processes", async () => {
-    const { runId, leaseId } = await seedLease();
+    const { runId, leaseId } = await seedLease({ status: "completed" });
     const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
     setSshRunStopRunnerForTests(runner);
 
     expect(await environmentRuntimeService(db).releaseRunLeases(runId, "released")).toHaveLength(1);
     expect(runner).not.toHaveBeenCalled();
-    expect(await leaseRow(leaseId)).toMatchObject({ status: "released" });
+    const row = await leaseRow(leaseId);
+    expect(row).toMatchObject({ status: "released" });
+    expect(row?.metadata?.remoteExecutionTermination).toBeUndefined();
+  });
+
+  it("keeps pending_cleanup when the remote exits without a proof marker", async () => {
+    const { runId, leaseId } = await seedLease();
+    setSshRunStopRunnerForTests(async () => ({ stdout: "stopped\n", stderr: "" }));
+
+    expect(await environmentRuntimeService(db).releaseRunLeases(runId, "expired")).toEqual([]);
+    expect(await leaseRow(leaseId)).toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "ssh_remote_stop_failed",
+    });
+  });
+
+  it("keeps pending_cleanup when a tagged process survives the remote stop", async () => {
+    const { runId, leaseId } = await seedLease();
+    setSshRunStopRunnerForTests(async () => ({
+      stdout: "paperclip-ssh-run-stop matched=1 remaining=1\n",
+      stderr: "",
+    }));
+
+    expect(await environmentRuntimeService(db).releaseRunLeases(runId, "expired")).toEqual([]);
+    expect(await leaseRow(leaseId)).toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "ssh_remote_stop_failed",
+    });
   });
 
   it("does not repeat the remote stop when the lease already carries its receipt", async () => {
