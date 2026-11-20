@@ -327,6 +327,57 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
   });
 
+  it("keeps a pending_cleanup lease failed when the retry cannot prove the stop", async () => {
+    const { environmentId, leaseId } = await seedLease({
+      leaseStatus: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "ssh_remote_stop_failed",
+    });
+    setSshRunStopRunnerForTests(async () => {
+      throw new Error("ssh unreachable");
+    });
+    const [environment] = await db.select().from(environments).where(eq(environments.id, environmentId));
+    const lease = await leaseRow(leaseId);
+
+    await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
+      environment: environment ?? null,
+      lease: lease!,
+    })).rejects.toThrow("ssh unreachable");
+    expect(await leaseRow(leaseId)).toMatchObject({
+      status: "pending_cleanup",
+      cleanupStatus: "failed",
+      failureReason: "ssh_remote_stop_failed",
+    });
+  });
+
+  it("does not repeat a pending_cleanup retry once the lease carries its receipt", async () => {
+    const { environmentId, leaseId } = await seedLease({
+      leaseStatus: "pending_cleanup",
+      cleanupStatus: "failed",
+    });
+    const row = await leaseRow(leaseId);
+    const receipt = remoteTerminationReceipt(row!, {
+      providerLeaseId: row!.providerLeaseId,
+      state: "stopped",
+    });
+    await db.update(environmentLeases)
+      .set({ metadata: { remoteExecutionTermination: receipt } })
+      .where(eq(environmentLeases.id, leaseId));
+    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+    const [environment] = await db.select().from(environments).where(eq(environments.id, environmentId));
+    const lease = await leaseRow(leaseId);
+
+    await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
+      environment: environment ?? null,
+      lease: lease!,
+    })).resolves.toEqual({
+      providerLeaseId: "ssh://ssh.example.test/workspace",
+      state: "stopped",
+    });
+    expect(runner).not.toHaveBeenCalled();
+  });
+
   it("does not repeat the remote stop when the lease already carries its receipt", async () => {
     const { runId, leaseId } = await seedLease();
     const row = await leaseRow(leaseId);
