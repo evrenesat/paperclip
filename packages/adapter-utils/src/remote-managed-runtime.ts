@@ -143,6 +143,13 @@ export async function prepareRemoteManagedRuntime(input: {
 }): Promise<PreparedRemoteManagedRuntime> {
   const baseWorkspaceRemoteDir = input.workspaceRemoteDir ?? input.spec.remoteCwd;
   const syncWorkspace = input.syncWorkspace !== false;
+  // The per-run scratch root on the remote: every run syncs the workspace
+  // into `.paperclip-runtime/runs/<runId>/workspace` under the base dir. Each
+  // run used to leave its full copy behind (15 GB on one host within days);
+  // the sync-back deletes it once the restore has landed on the host.
+  const workspaceRunScratchDir = syncWorkspace
+    ? path.posix.join(baseWorkspaceRemoteDir, ".paperclip-runtime", "runs", input.runId)
+    : null;
   const workspaceRemoteDir = syncWorkspace
     ? path.posix.join(
         baseWorkspaceRemoteDir,
@@ -158,6 +165,22 @@ export async function prepareRemoteManagedRuntime(input: {
     if (!privateRuntimeDir) return;
     await runSshCommand(input.spec, `rm -rf -- ${shellQuote(privateRuntimeDir)}`, { timeoutMs: 15_000 });
     privateRuntimeDir = null;
+  };
+  let runScratchCleanupStarted = false;
+  // Best-effort scratch deletion after the sync-back landed. A failure only
+  // logs: deleting scratch must never fail a run whose workspace is already
+  // safe on the host. Retained runtimes (warm reuse) keep the whole tree.
+  const cleanupRunScratchDir = async () => {
+    if (!workspaceRunScratchDir || input.retainRuntime || runScratchCleanupStarted) return;
+    runScratchCleanupStarted = true;
+    try {
+      await runSshCommand(input.spec, `rm -rf -- ${shellQuote(workspaceRunScratchDir)}`, { timeoutMs: 600_000 });
+    } catch (error) {
+      runScratchCleanupStarted = false;
+      console.warn(
+        `[paperclip] Could not delete the remote run scratch directory ${workspaceRunScratchDir}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   };
 
   const preparedWorkspace = syncWorkspace
@@ -215,17 +238,27 @@ export async function prepareRemoteManagedRuntime(input: {
       });
     }
   } catch (error) {
+    let recovered = false;
     try {
-      if (preparedWorkspace && baselineSnapshot) await restoreWorkspaceFromSshExecution({
-        spec: input.spec,
-        localDir: input.workspaceLocalDir,
-        remoteDir: workspaceRemoteDir,
-        baselineSnapshot,
-        restoreGitHistory: preparedWorkspace.gitBacked,
-        onProgress: input.onProgress,
-        repositories: repositoryBaselines,
-      });
-    } finally { await cleanupPrivateRuntime(); }
+      if (preparedWorkspace && baselineSnapshot) {
+        await restoreWorkspaceFromSshExecution({
+          spec: input.spec,
+          localDir: input.workspaceLocalDir,
+          remoteDir: workspaceRemoteDir,
+          baselineSnapshot,
+          restoreGitHistory: preparedWorkspace.gitBacked,
+          onProgress: input.onProgress,
+          repositories: repositoryBaselines,
+        });
+        recovered = true;
+      }
+    } finally {
+      await cleanupPrivateRuntime();
+    }
+    // Only a run that never started may drop its scratch, and only once the
+    // host workspace is safely back: a failed recovery restore leaves the
+    // remote tree as the next run's recovery source.
+    if (recovered) await cleanupRunScratchDir();
     throw error;
   }
 
@@ -297,6 +330,10 @@ export async function prepareRemoteManagedRuntime(input: {
     }
     if (!input.retainRuntime) {
       try { await cleanupPrivateRuntime(); } catch (error) { failure ??= error; }
+      // Scratch deletion runs only on a fully successful restore: a failed
+      // sync-back leaves the remote tree as the recovery source for the next
+      // run, and retained runtimes keep their assets in place.
+      if (!failure) await cleanupRunScratchDir();
     }
     if (failure) throw failure;
   };

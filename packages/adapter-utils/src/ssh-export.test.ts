@@ -72,7 +72,11 @@ describe("SSH git export", () => {
       baselineSnapshot: { exclude: [], entries: new Map() },
       restoreGitHistory: true,
       onProgress: async () => {},
-    })).rejects.toEqual(failure === "exit" ? new Error("export failed") : error);
+    })).rejects.toThrow(
+      failure === "exit"
+        ? "SSH workspace sync-back failed: export failed"
+        : "SSH workspace sync-back failed: transfer failed",
+    );
   });
 
   it.each([false, true])("drains the local bundle under backpressure with progress=%s", async (withProgress) => {

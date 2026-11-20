@@ -18,7 +18,8 @@ import {
 import type { RunProcessResult } from "./server-utils.js";
 import type { DirectorySnapshot } from "./workspace-restore-merge.js";
 
-import { mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { filterDirectorySnapshot, mergeDirectoryWithBaseline } from "./workspace-restore-merge.js";
+import { shouldExcludePath } from "./exclude-patterns.js";
 import {
   createRuntimeProgressReporter,
   type RuntimeProgressDirection,
@@ -27,6 +28,85 @@ import {
 } from "./runtime-progress.js";
 
 const SSH_STDIN_COMMAND = "IFS= read -r paperclip_ssh_command_b64 || exit 125; paperclip_ssh_command=$(printf '%s' \"$paperclip_ssh_command_b64\" | base64 -d) || exit 125; unset paperclip_ssh_command_b64; eval \"$paperclip_ssh_command\"";
+
+// Heavy directories the sync-back never transfers to the host. A run that
+// installs or builds inside the synced workspace (the leading cause of the
+// 2026-11-19 sync-back failures) otherwise ships gigabytes of regenerable
+// trees through the tar pipe and trips "file changed as we read it" while its
+// own background processes keep mutating them. This mirrors the sandbox
+// transport's heavy-dir policy in sandbox-managed-runtime.ts: node_modules is
+// regenerated on the host, never synced back. `.git/objects` covers build
+// checkouts cloned inside the workspace: their worktree files (the actual
+// edits) still sync back, their object packs do not. The four-pattern form
+// matches under GNU tar's unanchored exclusion patterns and under bsdtar.
+export const SSH_SYNC_BACK_HEAVY_DIR_EXCLUDES = [
+  "node_modules",
+  "node_modules/*",
+  "*/node_modules",
+  "*/node_modules/*",
+  ".git/objects",
+  ".git/objects/*",
+  "*/.git/objects",
+  "*/.git/objects/*",
+] as const;
+
+// Segment patterns for the same heavy directories, used to filter the restore
+// baseline so the merge never deletes the host's existing heavy files just
+// because their remote counterparts were skipped.
+const SSH_SYNC_BACK_HEAVY_DIR_SEGMENT_EXCLUDES = [
+  "node_modules",
+  "*/node_modules",
+  ".git/objects",
+  "*/.git/objects",
+] as const;
+
+// A single remote file above this size never syncs back; the host keeps its
+// previous copy. This caps the damage of one huge build artifact or dataset
+// without trying to mirror the remote's whole bulk. The probe is best-effort:
+// when it fails or finds too many candidates the restore proceeds unfiltered.
+export const SSH_SYNC_BACK_MAX_FILE_BYTES = 512 * 1024 * 1024;
+export const SSH_SYNC_BACK_SIZE_EXCLUDE_LIMIT = 500;
+
+// How far a from-remote tar failure may be downgraded to a warning. "none"
+// keeps the old fail-the-run behavior. "warnings" tolerates a tar that
+// completed with changed/shrinking files ("file changed as we read it"): the
+// archive still carries every file it read. "warningsAndMissing" additionally
+// tolerates entries that vanished mid-read ("Cannot open: No such file or
+// directory"): the baseline merge keeps the host's previous copy for anything
+// the archive is missing, so a partially-read tree cannot fail the run.
+export type SshSyncBackFailureTolerance = "none" | "warnings" | "warningsAndMissing";
+
+const SSH_TAR_CHANGED_FILE_RE = /file changed as we read it|file removed before we (?:read|got to)|File shrank by \d+ bytes/i;
+// GNU and bsdtar both name the errno for an entry that vanished mid-read
+// ("Cannot open: No such file or directory"). A permission failure prints a
+// different errno and stays fatal.
+const SSH_TAR_MISSING_FILE_RE = /no such file or directory/i;
+
+/**
+ * Classifies a failed from-remote tar (whose exit code rode the ssh channel)
+ * under a sync-back tolerance mode. Returns the tolerable verdict and the
+ * warning lines to note on the run; a non-tolerable failure keeps the raw
+ * stderr so the run carries the real cause.
+ */
+export function classifySshSyncBackTarFailure(input: {
+  exitCode: number;
+  stderr: string;
+  tolerance: SshSyncBackFailureTolerance;
+}): { tolerable: boolean; warnings: string[] } {
+  if (input.exitCode === 0) return { tolerable: true, warnings: [] };
+  if (input.tolerance === "none") return { tolerable: false, warnings: [] };
+  const lines = input.stderr.split("\n").map((line) => line.trim()).filter(Boolean);
+  if (lines.length === 0) return { tolerable: false, warnings: [] };
+  const benign = lines.filter((line) => SSH_TAR_CHANGED_FILE_RE.test(line));
+  if (benign.length === lines.length) {
+    return { tolerable: true, warnings: lines };
+  }
+  if (input.tolerance === "warningsAndMissing") {
+    const readable = lines.filter((line) => SSH_TAR_CHANGED_FILE_RE.test(line) || SSH_TAR_MISSING_FILE_RE.test(line));
+    if (readable.length === lines.length) return { tolerable: true, warnings: lines };
+  }
+  return { tolerable: false, warnings: [] };
+}
 
 export interface SshConnectionConfig {
   useHostAuth?: boolean;
@@ -623,15 +703,36 @@ async function clearLocalDirectory(
   );
 }
 
-async function copyDirectoryContents(sourceDir: string, targetDir: string): Promise<void> {
+async function copyDirectoryContents(
+  sourceDir: string,
+  targetDir: string,
+  onVanishedEntry?: (entry: string, error: unknown) => void,
+): Promise<void> {
   await fs.mkdir(targetDir, { recursive: true });
   const entries = await fs.readdir(sourceDir);
   await Promise.all(entries.map(async (entry) => {
-    await fs.cp(path.join(sourceDir, entry), path.join(targetDir, entry), {
-      recursive: true,
-      force: true,
-      preserveTimestamps: true,
-    });
+    try {
+      await fs.cp(path.join(sourceDir, entry), path.join(targetDir, entry), {
+        recursive: true,
+        force: true,
+        preserveTimestamps: true,
+        // Copy link targets verbatim. fs.cp's default re-resolves every
+        // symlink and rewrites the target against the destination, which
+        // turned pnpm's relative links into absolute paths into the deleted
+        // staging dir and corrupted the synced node_modules. The staging tree
+        // mirrors the remote layout, so the original target strings are
+        // exactly right in the destination.
+        verbatimSymlinks: true,
+      });
+    } catch (error) {
+      // A tree that loses files while the restore reads it must not fail the
+      // run: report the vanished entry and keep whatever did arrive.
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT" && onVanishedEntry) {
+        onVanishedEntry(entry, error);
+        return;
+      }
+      throw error;
+    }
   }));
 }
 
@@ -1076,6 +1177,45 @@ async function integrateImportedGitHead(input: {
   }
 
   throw new Error(`Failed to integrate concurrent SSH git history for ${input.importedHead.slice(0, 12)} after multiple retries.`);
+}
+
+// Best-effort remote probe for the sync-back size cap: lists regular files
+// above {@link SSH_SYNC_BACK_MAX_FILE_BYTES} so the tar can skip them and the
+// baseline merge can keep the host's previous copies. Returns [] when the
+// probe is unavailable or its result is unusable; that only costs bandwidth.
+async function listRemoteOversizedFiles(input: {
+  spec: SshConnectionConfig;
+  remoteDir: string;
+  onWarning?: (message: string) => void;
+}): Promise<string[]> {
+  try {
+    const result = await runSshScript(
+      input.spec,
+      `cd ${shellQuote(input.remoteDir)} && find . -type f -size +${SSH_SYNC_BACK_MAX_FILE_BYTES}c -print0`,
+      { timeoutMs: 60_000, maxBuffer: 1024 * 1024 },
+    );
+    const paths = result.stdout
+      .split("\0")
+      .map((entry) => entry.trim())
+      .filter(Boolean)
+      .map((entry) => (entry.startsWith("./") ? entry.slice(2) : entry))
+      .filter((entry) => {
+        if (!entry || path.posix.isAbsolute(entry)) return false;
+        return !entry.split("/").some((segment) => segment === ".." || segment.length === 0);
+      });
+    if (paths.length > SSH_SYNC_BACK_SIZE_EXCLUDE_LIMIT) {
+      input.onWarning?.(
+        `${paths.length} remote files exceed the ${Math.round(SSH_SYNC_BACK_MAX_FILE_BYTES / 1024 / 1024)} MB sync-back size cap; the cap is skipped for this restore`,
+      );
+      return [];
+    }
+    return paths;
+  } catch (error) {
+    input.onWarning?.(
+      `the remote size probe for the sync-back cap failed; large files are not filtered for this restore (${error instanceof Error ? error.message : String(error)})`,
+    );
+    return [];
+  }
 }
 
 async function clearRemoteDirectory(input: {
@@ -1567,12 +1707,37 @@ export async function syncDirectoryFromSsh(input: {
   preserveLocalEntries?: string[];
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
-}): Promise<void> {
+  failureTolerance?: SshSyncBackFailureTolerance;
+}): Promise<{ sizeSkippedPaths: string[]; warnings: string[] }> {
+  const warnings: string[] = [];
+  // Warning notes ride the same sink the byte-progress lines use, so an
+  // adapter that pipes restore progress into the run log notes the warning on
+  // the run for free.
+  const emitWarning = (message: string) => {
+    warnings.push(message);
+    const line = `[paperclip] Workspace sync-back warning: ${message}\n`;
+    if (input.onProgress) void input.onProgress(line);
+    else console.warn(line.trimEnd());
+  };
   const auth = await createSshAuthArgs(input.spec);
   const stagingDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-ssh-sync-back-"));
+  const sizeSkippedPaths = await listRemoteOversizedFiles({
+    spec: input.spec,
+    remoteDir: input.remoteDir,
+    onWarning: emitWarning,
+  });
   const remoteTarScript = [
     `cd ${shellQuote(input.remoteDir)}`,
-    `tar ${[...tarExcludeArgs(input.exclude).map(shellQuote), "-cf", "-", "."].join(" ")}`,
+    `tar ${[
+      ...tarExcludeArgs([
+        ...(input.exclude ?? []),
+        ...SSH_SYNC_BACK_HEAVY_DIR_EXCLUDES,
+        ...sizeSkippedPaths,
+      ]).map(shellQuote),
+      "-cf",
+      "-",
+      ".",
+    ].join(" ")}`,
   ].join(" && ");
   const sshArgs = [
     ...auth.args,
@@ -1619,8 +1784,16 @@ export async function syncDirectoryFromSsh(input: {
         if (settled || !sshExited || !tarExited) return;
         settled = true;
         if ((sshExitCode ?? 0) !== 0) {
-          reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
-          return;
+          const verdict = classifySshSyncBackTarFailure({
+            exitCode: sshExitCode ?? -1,
+            stderr: sshStderr,
+            tolerance: input.failureTolerance ?? "none",
+          });
+          if (!verdict.tolerable) {
+            reject(new Error(sshStderr.trim() || `ssh exited with code ${sshExitCode ?? -1}`));
+            return;
+          }
+          for (const warning of verdict.warnings) emitWarning(warning);
         }
         if ((tarExitCode ?? 0) !== 0) {
           reject(new Error(tarStderr.trim() || `tar exited with code ${tarExitCode ?? -1}`));
@@ -1666,7 +1839,10 @@ export async function syncDirectoryFromSsh(input: {
     await progress?.finish();
 
     await clearLocalDirectory(input.localDir, input.preserveLocalEntries);
-    await copyDirectoryContents(stagingDir, input.localDir);
+    await copyDirectoryContents(stagingDir, input.localDir, (entry, error) => {
+      emitWarning(`a restored entry vanished during the copy and was skipped: ${entry} (${error instanceof Error ? error.message : String(error)})`);
+    });
+    return { sizeSkippedPaths, warnings };
   } catch (error) {
     await progress?.fail();
     throw error;
@@ -1764,27 +1940,37 @@ export async function restoreWorkspaceFromSshExecution(input: {
   ) {
     throw new Error(`Workspace baseline must exclude ${PROJECT_REPOSITORIES_DIR} when project repositories are restored separately`);
   }
-  for (const repository of repositories) {
+  // A failed sync-back is an infrastructure failure, never a failed agent
+  // turn. Wrapping it with one stable marker lets the controller keep the
+  // agent out of the error state (the run still fails and carries the full
+  // message) while the workspace keeps its previous state for the next run.
+  try {
+    for (const repository of repositories) {
+      await restoreWorkspaceRootFromSsh({
+        spec: input.spec,
+        localDir: path.join(input.localDir, repository.path),
+        remoteDir: path.posix.join(remoteDir, repository.path),
+        baselineSnapshot: repository.baselineSnapshot,
+        restoreGitHistory: input.restoreGitHistory,
+        onProgress: input.onProgress,
+        progressLabel: repository.path,
+      });
+    }
     await restoreWorkspaceRootFromSsh({
       spec: input.spec,
-      localDir: path.join(input.localDir, repository.path),
-      remoteDir: path.posix.join(remoteDir, repository.path),
-      baselineSnapshot: repository.baselineSnapshot,
+      localDir: input.localDir,
+      remoteDir,
+      baselineSnapshot: input.baselineSnapshot,
       restoreGitHistory: input.restoreGitHistory,
       onProgress: input.onProgress,
-      progressLabel: repository.path,
+      progressLabel: "workspace",
+      hasProjectRepositories: repositories.length > 0,
     });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (message.startsWith("SSH workspace sync-back failed")) throw error;
+    throw new Error(`SSH workspace sync-back failed: ${message}`, { cause: error });
   }
-  await restoreWorkspaceRootFromSsh({
-    spec: input.spec,
-    localDir: input.localDir,
-    remoteDir,
-    baselineSnapshot: input.baselineSnapshot,
-    restoreGitHistory: input.restoreGitHistory,
-    onProgress: input.onProgress,
-    progressLabel: "workspace",
-    hasProjectRepositories: repositories.length > 0,
-  });
 }
 
 async function restoreWorkspaceRootFromSsh(input: {
@@ -1814,16 +2000,30 @@ async function restoreWorkspaceRootFromSsh(input: {
           onProgress: input.onProgress,
         })
         : null;
-      await syncDirectoryFromSsh({
+      const { sizeSkippedPaths } = await syncDirectoryFromSsh({
         spec: input.spec,
         remoteDir,
         localDir: stagingDir,
         exclude: input.baselineSnapshot.exclude,
         onProgress: input.onProgress,
         progressLabel: input.progressLabel,
+        // The baseline merge keeps the host's previous copy for anything the
+        // remote tree lost or skipped, so a partially-read tree is a warning,
+        // not a failed run.
+        failureTolerance: "warningsAndMissing",
       });
+      const sizeSkipped = new Set(sizeSkippedPaths);
       await mergeDirectoryWithBaseline({
-        baseline: input.baselineSnapshot,
+        // The merge baseline drops the heavy dirs the tar skipped and any
+        // size-capped files: the host keeps its previous copies instead of
+        // deleting them for absence from the archive.
+        baseline: await filterDirectorySnapshot(input.baselineSnapshot, {
+          drop: (relative) =>
+            shouldExcludePath(relative, SSH_SYNC_BACK_HEAVY_DIR_SEGMENT_EXCLUDES) ||
+            sizeSkipped.has(relative),
+          exclude: input.baselineSnapshot.exclude,
+          ignoredPaths: input.baselineSnapshot.ignoredPaths,
+        }),
         sourceDir: stagingDir,
         targetDir: input.localDir,
         // Git history advances via integrateImportedGitHead; the working tree
@@ -1870,9 +2070,15 @@ async function restoreWorkspaceRootFromSsh(input: {
       remoteDir,
       localDir: input.localDir,
       exclude: [".git", ".paperclip-runtime", ...projectRepositoryEntries],
-      preserveLocalEntries: [".git", ...projectRepositoryEntries],
+      // The tar skips node_modules (and the size cap), so the wipe must keep
+      // the host's top-level node_modules instead of deleting them for a
+      // directory that never arrived.
+      preserveLocalEntries: [".git", "node_modules", ...projectRepositoryEntries],
       onProgress: input.onProgress,
       progressLabel: input.progressLabel,
+      // Direct replace: the archive must stay complete, but files that raced
+      // the tar are a warning, not a failed run.
+      failureTolerance: "warnings",
     });
     return;
   }
@@ -1882,8 +2088,10 @@ async function restoreWorkspaceRootFromSsh(input: {
     remoteDir,
     localDir: input.localDir,
     exclude: [".paperclip-runtime"],
+    preserveLocalEntries: ["node_modules"],
     onProgress: input.onProgress,
     progressLabel: input.progressLabel,
+    failureTolerance: "warnings",
   });
 }
 

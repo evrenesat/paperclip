@@ -3389,10 +3389,30 @@ describe("isWorkspaceSyncConflictFailure", () => {
       "Failed to integrate concurrent remote git history for a5d46a8005b3 after multiple retries.",
     )).toBe(true);
     expect(isWorkspaceSyncConflictFailure(
+      "Failed to merge concurrent SSH git histories for a5d46a8005b3 and c1042c11774a: Command failed: git merge-tree --write-tree",
+    )).toBe(true);
+    expect(isWorkspaceSyncConflictFailure(
+      "Failed to integrate concurrent SSH git history for a5d46a8005b3 after multiple retries.",
+    )).toBe(true);
+    expect(isWorkspaceSyncConflictFailure(
       "error: /tmp/restore/git-delta.bundle did not send all necessary objects",
     )).toBe(true);
     expect(isWorkspaceSyncConflictFailure(
       "error: Repository lacks these prerequisite commits: 4c631700",
+    )).toBe(true);
+  });
+
+  it("matches the SSH sync-back transport failure marker", () => {
+    expect(isWorkspaceSyncConflictFailure(
+      "SSH workspace sync-back failed: tar: ./temp/pc-evr267/paperclip/node_modules/.pnpm: file changed as we read it",
+    )).toBe(true);
+    expect(isWorkspaceSyncConflictFailure(
+      "SSH workspace sync-back failed: ssh exited with code 255",
+    )).toBe(true);
+    // The marker rides the failure message wherever the sync-back threw, so a
+    // failed copy-back keeps the agent idle while the run still fails.
+    expect(isWorkspaceSyncConflictFailure(
+      "Adapter execution failed. SSH workspace sync-back failed: export failed",
     )).toBe(true);
   });
 
