@@ -811,6 +811,77 @@ describe("ssh env-lab fixture", () => {
     expect(await readFile(path.join(started.workspaceDir, "node_modules", "personal.bin"))).toEqual(binary);
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("skips remote node_modules on sync-back, preserves local copies, and deletes the per-run scratch", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const localRepo = path.join(rootDir, "local-workspace");
+
+    await mkdir(localRepo, { recursive: true });
+    await mkdir(path.join(localRepo, "node_modules"), { recursive: true });
+    await git(localRepo, ["init"]);
+    await git(localRepo, ["checkout", "-b", "main"]);
+    await git(localRepo, ["config", "user.name", "Paperclip Test"]);
+    await git(localRepo, ["config", "user.email", "test@paperclip.dev"]);
+    await writeFile(path.join(localRepo, "tracked.txt"), "base\n", "utf8");
+    await writeFile(path.join(localRepo, ".gitignore"), "node_modules/\n", "utf8");
+    await git(localRepo, ["add", "tracked.txt", ".gitignore"]);
+    await git(localRepo, ["commit", "-m", "initial"]);
+    await writeFile(path.join(localRepo, "node_modules", "local.txt"), "local deps\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH sync-back heavy-dir skip test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir } as const;
+
+    const prepared = await prepareRemoteManagedRuntime({
+      spec,
+      runId: "run-scratch",
+      adapterKey: "test-adapter",
+      workspaceLocalDir: localRepo,
+    });
+    const scratchDir = path.posix.join(started.workspaceDir, ".paperclip-runtime", "runs", "run-scratch");
+    expect(prepared.workspaceRemoteDir).toBe(path.posix.join(scratchDir, "workspace"));
+
+    // The agent's remote work: a tracked edit plus a fresh node_modules tree.
+    await runSshCommand(
+      config,
+      [
+        `cd ${JSON.stringify(prepared.workspaceRemoteDir)}`,
+        `git config user.name "Paperclip SSH"`,
+        `git config user.email "ssh@paperclip.dev"`,
+        `printf "remote edit\\n" > tracked.txt`,
+        `mkdir -p node_modules/.pnpm`,
+        `printf "remote deps\\n" > node_modules/.pnpm/remote.txt`,
+        `git add tracked.txt`,
+        `git commit -m "remote update" >/dev/null`,
+      ].join(" && "),
+      { timeoutMs: 30_000, maxBuffer: 256 * 1024 },
+    );
+    const remoteBefore = await runSshCommand(
+      config,
+      `test -d ${JSON.stringify(scratchDir)} && echo present || echo missing`,
+      { timeoutMs: 15_000, maxBuffer: 16 * 1024 },
+    );
+    expect(remoteBefore.stdout.trim()).toBe("present");
+
+    await prepared.restoreWorkspace();
+
+    // The tracked edit and the remote commit landed; the remote node_modules
+    // did not, and the host's own node_modules survived untouched.
+    expect(await git(localRepo, ["log", "-1", "--pretty=%s"])).toBe("remote update");
+    expect(await readFile(path.join(localRepo, "tracked.txt"), "utf8")).toBe("remote edit\n");
+    expect(await readFile(path.join(localRepo, "node_modules", "local.txt"), "utf8")).toBe("local deps\n");
+    await expect(stat(path.join(localRepo, "node_modules", ".pnpm"))).rejects.toMatchObject({ code: "ENOENT" });
+
+    // The per-run scratch is gone after the successful sync-back.
+    const remoteAfter = await runSshCommand(
+      config,
+      `test -d ${JSON.stringify(scratchDir)} && echo present || echo missing`,
+      { timeoutMs: 15_000, maxBuffer: 16 * 1024 },
+    );
+    expect(remoteAfter.stdout.trim()).toBe("missing");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS * 2);
+
   it("round-trips a git workspace through the SSH fixture", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

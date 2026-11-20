@@ -339,16 +339,21 @@ export function isConfigurationIncompleteFailedRun(
 }
 
 /**
- * Failure signatures from sandbox→host git workspace reconciliation. These
- * describe the state of the SHARED workspace (divergent histories written by
- * different runs), not a defect in the agent that happened to run last —
- * putting the agent into a sticky `error` state over them removes a healthy
- * agent from rotation while leaving the actual problem (the workspace)
- * untouched. The run still fails and carries the full message.
+ * Failure signatures from workspace sync machinery. These describe the state
+ * of the SHARED workspace or of the copy-back transport (divergent histories
+ * written by different runs, a remote tree that changed or lost files under
+ * the SSH sync-back tar), not a defect in the agent that happened to run last
+ * — putting the agent into a sticky `error` state over them removes a healthy
+ * agent from rotation while leaving the actual problem (the workspace or the
+ * transport) untouched. The run still fails and carries the full message; the
+ * next run retries the sync-back.
  */
 const WORKSPACE_SYNC_CONFLICT_SIGNATURES = [
   "Failed to merge concurrent remote git histories",
   "Failed to integrate concurrent remote git history",
+  "Failed to merge concurrent SSH git histories",
+  "Failed to integrate concurrent SSH git history",
+  "SSH workspace sync-back failed",
   "did not send all necessary objects",
   "lacks these prerequisite commits",
 ];
