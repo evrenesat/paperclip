@@ -4,7 +4,7 @@ import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
 import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
-import { hasOperatorStopAttestation, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasOperatorStopAttestation, hasRemoteTerminationReceipt, requiresRemoteStopProof } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
@@ -50,9 +50,14 @@ export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Pro
       if (run.status !== "cancelled" || !unfinished.length) continue;
       // An SSH release is a database write and never produces a provider
       // receipt. The local SSH client exiting does not prove the remote
-      // command stopped, so only a bound receipt or operator attestation
-      // counts; the process checks below are about local execution only.
-      return "remote_stop_unconfirmed";
+      // command stopped, so leases under the stop contract need a bound receipt
+      // or operator attestation; the process checks below are about local
+      // execution only. Pre-contract SSH leases cannot ever obtain proof, so
+      // they keep the legacy fall-through rather than blocking forever.
+      if (unfinished.some(requiresRemoteStopProof)) return "remote_stop_unconfirmed";
+      // A pre-contract lease is only grandfathered when the run recorded the
+      // local SSH client; a null pid is no evidence at all.
+      if (!run.processPid && !run.processGroupId) return "remote_stop_unconfirmed";
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
     let groupAlive = Boolean(run.processGroupId && !absent(-run.processGroupId));

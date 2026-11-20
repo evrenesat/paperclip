@@ -21,8 +21,8 @@ import { historicalCleanupVerificationService } from "../services/historical-cle
 import { heartbeatService } from "../services/heartbeat.js";
 import { environmentRuntimeService } from "../services/environment-runtime.js";
 import { writeEnvironmentCleanup } from "../services/environment-cleanup-notifications.js";
-import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
-import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { SSH_REMOTE_STOP_CONTRACT, remoteTerminationReceipt } from "../services/remote-execution-termination.js";
+import { agentExecutionStopBlocker, agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
 
 import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database.js";
 
@@ -367,15 +367,15 @@ describe.skipIf(!support.supported)("environment cleanup scheduling", () => {
     expect((await environmentService(db).getLeaseById(lease.id))?.status).toBe("expired");
     await quiet();
   });
-  it("does not treat an absent local SSH client as remote stop proof", async () => {
+  it("does not treat an absent local SSH client as stop proof for a contracted lease", async () => {
     const [agent] = await db.insert(agents).values({ companyId, name: "SSH workspace owner" }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "cancelled",
       runtimeMode: "legacy", invocationSource: "on_demand", processPid: 2_000_000_000,
       startedAt: new Date(Date.now() - 60_000), finishedAt: new Date() }).returning();
     await db.insert(environmentLeases).values({ companyId, environmentId, heartbeatRunId: run.id, provider: "ssh",
       providerLeaseId: randomUUID(), leasePolicy: "ephemeral", status: "released", cleanupStatus: "success",
-      releasedAt: new Date(), metadata: { driver: "ssh" } });
-    expect(await agentExecutionsHaveStopped(db, [agent.id])).toBe(false);
+      releasedAt: new Date(), metadata: { driver: "ssh", remoteStopContract: SSH_REMOTE_STOP_CONTRACT } });
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("remote_stop_unconfirmed");
   });
   async function recoveredWorkspaceCleanup() {
     const [agent] = await db.insert(agents).values({ companyId, name: "Stopped workspace owner" }).returning();

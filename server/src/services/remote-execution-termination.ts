@@ -47,6 +47,16 @@ export function operatorStopAttestation(
   };
 }
 
+/** Marks a lease created by a runtime that stops SSH work by run id and can
+ * therefore require a bound stop receipt. Leases acquired before this contract
+ * existed carry no proof and no way to produce one, so they keep the legacy
+ * local-process fall-through instead of blocking an agent forever. */
+export const SSH_REMOTE_STOP_CONTRACT = "paperclip.ssh-remote-stop.v1";
+
+export function requiresRemoteStopProof(lease: Pick<ReceiptLease, "provider" | "metadata">): boolean {
+  return lease.provider !== "ssh" || lease.metadata?.remoteStopContract === SSH_REMOTE_STOP_CONTRACT;
+}
+
 /** A board operator attested that the remote work of this cancelled SSH run
  * stopped, after the lease was released without a provider receipt. */
 export function hasOperatorStopAttestation(lease: ReceiptLease): boolean {
