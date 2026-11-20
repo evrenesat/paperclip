@@ -148,6 +148,7 @@ import {
   TERMINAL_HEARTBEAT_RUN_STATUSES,
   issueService,
   executeIssuePostCommitActions,
+  type IssueDependencyReadiness,
   type IssuePostCommitAction,
 } from "../issues.js";
 import {
@@ -6116,6 +6117,39 @@ export function recoveryService(
     return result;
   }
 
+  /**
+   * One log line per skipped blocked candidate names why the backstop left it
+   * stranded. The skip counters alone cannot say which task a stuck
+   * workspace-finalize barrier is holding or by what, and a stranded dependent
+   * produces no wake row or activity to inspect.
+   */
+  function logResolvedDependencyWakeBackstopSkip(
+    source: string,
+    candidate: {
+      id: string;
+      identifier: string | null;
+      companyId: string;
+      blockedTransitionAt: Date | null;
+    },
+    readiness: IssueDependencyReadiness | undefined,
+    reason: string,
+  ) {
+    logger.info(
+      {
+        source,
+        companyId: candidate.companyId,
+        issueId: candidate.id,
+        issueIdentifier: candidate.identifier,
+        blockedTransitionAt: candidate.blockedTransitionAt?.toISOString() ?? null,
+        blockerIssueIds: readiness?.blockerIssueIds ?? [],
+        unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [],
+        pendingFinalizeBlockerIssueIds: readiness?.pendingFinalizeBlockerIssueIds ?? [],
+        skipReason: reason,
+      },
+      "issue graph liveness backstop left a blocked dependency wake unhealed",
+    );
+  }
+
   async function reconcileResolvedDependencyWakeBackstop(
     opts?: ResolvedDependencyWakeBackstopOptions,
   ) {
@@ -6267,6 +6301,7 @@ export function recoveryService(
           !resolvedBlockerIssueId
         ) {
           result.notReadySkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "not_ready");
           continue;
         }
 
@@ -6289,6 +6324,7 @@ export function recoveryService(
           });
         if (existingWake) {
           result.existingWakeSkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "wake_already_emitted");
           continue;
         }
         // The assignee agent opened this blocked cycle itself, knowing its recorded
@@ -6297,6 +6333,7 @@ export function recoveryService(
         // stamps a new cycle, so the ready-state key never repeats).
         if (await wasBlockedByAssigneeAgent(companyId, candidate.id, agentId, candidate.blockedTransitionAt, readiness.blockerIssueIds)) {
           result.selfBlockedSkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "self_blocked_by_assignee");
           continue;
         }
 
@@ -6305,11 +6342,13 @@ export function recoveryService(
           (await hasQueuedIssueWake(companyId, candidate.id, agentId))
         ) {
           result.livePathSkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "live_execution_path");
           continue;
         }
 
         if (await hasPendingWakeInteraction(companyId, candidate.id)) {
           result.interactionSkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "pending_wake_interaction");
           continue;
         }
 
@@ -6322,6 +6361,7 @@ export function recoveryService(
           )
         ) {
           result.pauseHoldSkipped += 1;
+          logResolvedDependencyWakeBackstopSkip(source, candidate, readiness, "pause_hold");
           continue;
         }
 

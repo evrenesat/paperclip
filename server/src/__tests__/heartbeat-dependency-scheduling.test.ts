@@ -277,6 +277,77 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     }
   }, 45_000);
 
+  it("runs a created-as-blocked dependent's blockers-resolved wake once its done blocker's ended run has finalized", async () => {
+    const companyId = randomUUID();
+    const blockerAgentId = randomUUID();
+    const reviewAgentId = randomUUID();
+    const blockerId = randomUUID();
+    const dependentId = randomUUID();
+    const workspaceId = randomUUID();
+    const blockerRunId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Created blocked review",
+      issuePrefix: `CB${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user", status: "active", membershipRole: "member" });
+    await db.insert(agents).values([
+      { id: blockerAgentId, companyId, name: "Blocker owner", role: "engineer",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, permissions: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } } },
+      { id: reviewAgentId, companyId, name: "Reviewer", role: "engineer",
+        status: "active", adapterType: "codex_local", adapterConfig: {}, permissions: {},
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 2 } } },
+    ]);
+    await db.insert(executionWorkspaces).values({
+      id: workspaceId, companyId, mode: "shared_workspace", strategyType: "project_primary",
+      name: "Review workspace", status: "active",
+    });
+    await db.insert(issues).values([
+      { id: blockerId, companyId, title: "Refine the plan", status: "done",
+        assigneeAgentId: blockerAgentId, executionWorkspaceId: workspaceId,
+        responsibleUserId: "responsible-user",
+        completedAt: new Date("2026-11-18T15:55:59.000Z") },
+      { id: dependentId, companyId, parentId: blockerId, title: "Plan review", status: "blocked",
+        assigneeAgentId: reviewAgentId, executionWorkspaceId: workspaceId,
+        responsibleUserId: "responsible-user" },
+    ]);
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: dependentId, type: "blocks" });
+    await db.insert(heartbeatRuns).values({
+      id: blockerRunId, companyId, agentId: blockerAgentId, issueId: blockerId, status: "succeeded",
+      startedAt: new Date("2026-11-18T15:50:00.000Z"), finishedAt: new Date("2026-11-18T15:55:59.000Z"),
+    });
+    await db.insert(workspaceOperations).values([
+      { companyId, executionWorkspaceId: workspaceId, issueId: blockerId, heartbeatRunId: blockerRunId,
+        phase: "workspace_finalize", status: "succeeded",
+        startedAt: new Date("2026-11-18T15:55:57.000Z"), finishedAt: new Date("2026-11-18T15:55:59.000Z") },
+      { companyId, executionWorkspaceId: workspaceId, issueId: blockerId, heartbeatRunId: blockerRunId,
+        phase: "remote_workspace_snapshot", status: "succeeded",
+        startedAt: new Date("2026-11-18T15:55:58.000Z"), finishedAt: new Date("2026-11-18T15:55:59.400Z") },
+    ]);
+
+    const run = await heartbeat.wakeup(reviewAgentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_blockers_resolved",
+      payload: { issueId: dependentId, resolvedBlockerIssueId: blockerId, blockerIssueIds: [blockerId] },
+      idempotencyKey: `issue_blockers_resolved:state:${dependentId}:1:test`,
+      requestedByActorType: "system",
+      requestedByActorId: "issue_update",
+      contextSnapshot: {
+        issueId: dependentId, taskId: dependentId, wakeReason: "issue_blockers_resolved",
+        source: "issue.blockers_resolved", resolvedBlockerIssueId: blockerId, blockerIssueIds: [blockerId],
+      },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const [dependentRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(dependentRun?.status).toBe("succeeded");
+    expect(dependentRun?.contextSnapshot).toMatchObject({ wakeReason: "issue_blockers_resolved" });
+    const dependencyWaits = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+    ));
+    expect(dependencyWaits).toEqual([]);
+  }, 45_000);
+
   it("keeps a saved native continuation behind its active predecessor without retagging that run", async () => {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     let finishPredecessor!: () => void;
