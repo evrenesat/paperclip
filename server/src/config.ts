@@ -96,6 +96,9 @@ export interface Config {
   feedbackExportBackendToken: string | undefined;
   heartbeatSchedulerEnabled: boolean;
   heartbeatSchedulerIntervalMs: number;
+  agentFocusGraceWindowMs: number;
+  agentFocusIdleTimeoutMs: number;
+  agentFocusHardMaxMs: number;
   companyDeletionEnabled: boolean;
   telemetryEnabled: boolean;
   announcementsEnabled: boolean;
@@ -362,6 +365,9 @@ export function loadConfig(): Config {
     feedbackExportBackendToken,
     heartbeatSchedulerEnabled: process.env.HEARTBEAT_SCHEDULER_ENABLED !== "false",
     heartbeatSchedulerIntervalMs: Math.max(10000, Number(process.env.HEARTBEAT_SCHEDULER_INTERVAL_MS) || 30000),
+    agentFocusGraceWindowMs: Math.max(0, Number(process.env.AGENT_FOCUS_GRACE_WINDOW_MS) || 5 * 60 * 1000),
+    agentFocusIdleTimeoutMs: Math.max(60000, Number(process.env.AGENT_FOCUS_IDLE_TIMEOUT_MS) || 10 * 60 * 1000),
+    agentFocusHardMaxMs: Math.max(60000, Number(process.env.AGENT_FOCUS_HARD_MAX_MS) || 8 * 60 * 60 * 1000),
     companyDeletionEnabled,
     telemetryEnabled: fileConfig?.telemetry?.enabled ?? true,
     announcementsEnabled: process.env.PAPERCLIP_ANNOUNCEMENTS_ENABLED !== "false",

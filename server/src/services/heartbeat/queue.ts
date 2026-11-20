@@ -1,4 +1,7 @@
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
+import {
+  resolveFocusAdmission,
+} from "../agent-focus.js";
 import { normalizeAgentNameKey } from "./retries.js";
 import { publishActiveDotComment } from "../dot-assignment-follow-up.js";
 import {
@@ -1936,10 +1939,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
 
-      const dependencyReadiness = await listQueuedRunDependencyReadiness(
-        agent.companyId,
-        queuedRuns,
-      );
       const queuedIssueIds = [
         ...new Set(
           queuedRuns
@@ -1949,6 +1948,31 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             .filter((issueId): issueId is string => Boolean(issueId)),
         ),
       ];
+
+      // An active focus gates the queue: only the focused issue, its
+      // descendants, its blockers assigned to this agent, owner chat and
+      // interaction answers may start. Other runs stay queued (deferred and
+      // coalesced per issue), not dropped.
+      const focusAdmission = await resolveFocusAdmission(db, agent, queuedIssueIds);
+      let claimableRuns = queuedRuns;
+      if (focusAdmission) {
+        claimableRuns = queuedRuns.filter((run) => {
+          const context = parseObject(run.contextSnapshot);
+          if (hasInteractionContinuationWakeContext(context)) return true;
+          const runIssueId =
+            readNonEmptyString(context.issueId) ??
+            readNonEmptyString(context.taskId);
+          return runIssueId
+            ? focusAdmission.allowedIssueIds.has(runIssueId)
+            : false;
+        });
+        if (claimableRuns.length === 0) return [];
+      }
+
+      const dependencyReadiness = await listQueuedRunDependencyReadiness(
+        agent.companyId,
+        claimableRuns,
+      );
       const issueRows = await db
         .select({
           id: issues.id,
@@ -1966,7 +1990,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         );
       const issueById = new Map(issueRows.map((row) => [row.id, row]));
       const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
+      const prioritizedRuns = [...claimableRuns].sort((left, right) => {
         const leftIssueId = readNonEmptyString(
           parseObject(left.contextSnapshot).issueId,
         );
@@ -1987,18 +2011,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           : true;
         const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
         const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
+        const rankFor = (issueId: string | null, ready: boolean, issue: { status: string } | null | undefined) => {
+          // The focused issue ranks first, ahead of the in-progress rank.
+          if (focusAdmission && issueId && ready && issueId === focusAdmission.focusIssueId) return -1;
+          return ready && issue?.status === "in_progress" ? 0 : 1;
+        };
         const leftRank = leftIssueId
           ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
+            ? rankFor(leftIssueId, leftReady, leftIssue)
             : 3
           : 2;
         const rightRank = rightIssueId
           ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
+            ? rankFor(rightIssueId, rightReady, rightIssue)
             : 3
           : 2;
         if (leftRank !== rightRank) return leftRank - rightRank;

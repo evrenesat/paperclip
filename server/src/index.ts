@@ -1611,6 +1611,13 @@ async function startServerWithDatabaseTeardown(
         if (swept.cleared > 0) {
           logger.warn({ ...swept }, "startup stale-lock sweeper cleared issue locks");
         }
+
+        // Focus deadlines (grace window, idle timeout, hard max) are re-derived
+        // from agents.focus_started_at, so one startup sweep restores them.
+        const focusSwept = await heartbeat.agentFocus.sweepAgentFocus();
+        if (focusSwept.cancelledRunIds.length > 0 || focusSwept.endedAgentIds.length > 0) {
+          logger.warn({ ...focusSwept }, "startup agent-focus sweep enforced switches");
+        }
       })().catch((err) => {
         logger.error({ err }, "startup heartbeat recovery failed");
         throw err;
@@ -1841,6 +1848,12 @@ async function startServerWithDatabaseTeardown(
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
+              }
+            })
+            .then(async () => {
+              const swept = await heartbeat.agentFocus.sweepAgentFocus();
+              if (swept.cancelledRunIds.length > 0 || swept.endedAgentIds.length > 0) {
+                logger.warn({ ...swept }, "periodic agent-focus sweep enforced switches");
               }
             })
             .catch((err) => {

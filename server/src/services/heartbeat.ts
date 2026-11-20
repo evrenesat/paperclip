@@ -514,6 +514,8 @@ import {
 } from "./recovery/stranded-notice.js";
 
 import { recoveryService } from "./recovery/service.js";
+import { agentFocusService } from "./agent-focus.js";
+import { loadConfig } from "../config.js";
 import {
   createRunDispatch,
   type PostCommitEffect,
@@ -1084,6 +1086,19 @@ export function heartbeatService(
     transientRetryBudgetSpent: (run) =>
       executionFailureRetryCount(run) >=
       BOUNDED_TRANSIENT_HEARTBEAT_RETRY_MAX_ATTEMPTS,
+  });
+  const agentFocus = agentFocusService(db, {
+    heartbeat: {
+      wakeup: (agentId, opts) => enqueueWakeup(agentId, opts as WakeupOptions),
+      cancelRun: (runId, reason, options) =>
+        cancelRunInternal(runId, reason, options as CancelRunOptions),
+    },
+    issues: issuesSvc,
+    config: {
+      agentFocusGraceWindowMs: loadConfig().agentFocusGraceWindowMs,
+      agentFocusIdleTimeoutMs: loadConfig().agentFocusIdleTimeoutMs,
+      agentFocusHardMaxMs: loadConfig().agentFocusHardMaxMs,
+    },
   });
   const runDispatch = createRunDispatch(db);
   const {
@@ -5263,6 +5278,7 @@ export function heartbeatService(
     scheduleBoundedRetry,
 
     reconcileStrandedAssignedIssues,
+    agentFocus,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
 

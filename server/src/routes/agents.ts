@@ -1,4 +1,5 @@
 import { cancellationRequestId } from "../services/native-runtime/native-cancellation-request.js";
+import { agentFocusService } from "../services/agent-focus.js";
 import { agentEnvironmentTestService } from "../services/agent-environment-test.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 
@@ -111,6 +112,8 @@ import {
   workspaceOperationService,
 } from "../services/index.js";
 import { badRequest, conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
+import { focusAgentSchema } from "@paperclipai/shared";
+import { loadConfig } from "../config.js";
 import { ONBOARDING_FIRST_TASK_SKILL_KEY, PAPERCLIP_CORE_SKILL_KEYS } from "../services/company-skills.js";
 import { createRunSecretRedactionRegistry } from "../services/run-secret-redaction.js";
 import { assertAuthenticated, assertBoard, assertCompanyAccess, assertInstanceAdmin, buildActorSecretContext, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
@@ -765,6 +768,17 @@ export function agentRoutes(
     logger.warn({ error }, "provider trace expiry cleanup failed");
   });
   const recovery = recoveryService(db, { enqueueWakeup: heartbeat.wakeup });
+  const focusConfig = loadConfig();
+  const agentFocus = agentFocusService(db, {
+    heartbeat,
+    issues: issueService(db),
+    pauseAgent: (agentId) => svcLifecycle.pauseAgent(agentId),
+    config: {
+      agentFocusGraceWindowMs: focusConfig.agentFocusGraceWindowMs,
+      agentFocusIdleTimeoutMs: focusConfig.agentFocusIdleTimeoutMs,
+      agentFocusHardMaxMs: focusConfig.agentFocusHardMaxMs,
+    },
+  });
   const issueApprovalsSvc = issueApprovalService(db);
   const secretsSvc = secretService(db);
   const instructions = agentInstructionsService(db);
@@ -5457,6 +5471,48 @@ export function agentRoutes(
     });
 
     res.json(redactAgentRowForResponse(agent));
+  });
+
+  router.get("/agents/:id/focus", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const state = await agentFocus.getAgentFocusState(id);
+    res.json(state);
+  });
+
+  router.post("/agents/:id/focus", validate(focusAgentSchema), async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const issueId = req.body.issueId as string;
+    const mode = req.body.mode === "right_away" ? "right_away" : "gracefully";
+    const note = typeof req.body.note === "string" && req.body.note.trim() ? req.body.note.trim() : null;
+    const pauseAgentIds = Array.isArray(req.body.pauseAgentIds)
+      ? req.body.pauseAgentIds.filter((candidate: unknown): candidate is string =>
+          typeof candidate === "string")
+      : [];
+    const result = await agentFocus.focusAgentOnIssue({
+      agentId: id,
+      issueId,
+      mode,
+      note,
+      pauseAgentIds,
+      actor: { userId: req.actor.userId ?? null },
+    });
+    res.json(result);
+  });
+
+  router.delete("/agents/:id/focus", async (req, res) => {
+    assertBoard(req);
+    const id = req.params.id as string;
+    if (!(await getAccessibleAgent(req, res, id))) return;
+    const result = await agentFocus.endFocus({
+      agentId: id,
+      reason: "owner_ended",
+      actor: { userId: req.actor.userId ?? null },
+    });
+    res.json(result);
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {

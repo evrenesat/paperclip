@@ -224,6 +224,17 @@ export const agentMineInboxQuerySchema = z.object({
 
 export type AgentMineInboxQuery = z.infer<typeof agentMineInboxQuerySchema>;
 
+export const focusAgentSchema = z.object({
+  issueId: z.string().uuid(),
+  mode: z.enum(["gracefully", "right_away"]).optional().default("gracefully"),
+  /** Optional note to the agent about the switch. */
+  note: z.string().trim().max(2000).optional().nullable(),
+  /** Other agents to pause together with the switch. */
+  pauseAgentIds: z.array(z.string().uuid()).optional(),
+});
+
+export type FocusAgentInput = z.infer<typeof focusAgentSchema>;
+
 export const wakeAgentSchema = z.object({
   source: z
     .enum(["timer", "assignment", "on_demand", "automation"])

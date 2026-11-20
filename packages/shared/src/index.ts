@@ -1918,6 +1918,7 @@ export {
   createAgentKeySchema,
   agentMineInboxQuerySchema,
   wakeAgentSchema,
+  focusAgentSchema,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
   agentPermissionsSchema,

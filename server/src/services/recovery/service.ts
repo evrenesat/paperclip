@@ -866,6 +866,9 @@ function isOperatorCancelledRun(
     return true;
   if (!latestRun || latestRun.status !== "cancelled") return false;
   if (latestRun.errorCode === "operator_interrupted") return true;
+  // A focus preemption ("Do now") is deliberate; the focus-end sweep owns the
+  // resume, so the stranded-issue recovery must not re-wake it mid-focus.
+  if (latestRun.errorCode === "focus_preempted") return true;
   const result = parseObject(latestRun.resultJson);
   return (
     result.cancelledByActorType === "user" ||
