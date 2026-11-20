@@ -310,6 +310,27 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 `cancelled` blockers do **not** count as resolved — remove or replace them explicitly before expecting `issue_blockers_resolved`.
 
+## Do Now Switches (Focus)
+
+The owner can focus an agent on one task ("Do now"). While a focus is active on
+you, only the focused task (plus its children, its blockers assigned to you,
+owner chat and interaction answers) may start; your other queued work is
+deferred, not dropped, and resumes when the focus ends.
+
+**When a switch comment arrives** (a system comment saying the owner asked you
+to switch to another task, delivered as a steer or in your next context):
+
+1. Commit and push your current WIP.
+2. Leave a short resume note as your last comment on the issue you are leaving
+   (what state it is in, what the next run should do first).
+3. End your run promptly — do not start new work on the old task.
+
+If you do not end within the grace window (default 5 minutes), the run is
+cancelled with reason `focus_preempted`. That cancel is deliberate: it is not a
+failure, costs no retry budget, and triggers no recovery — the focus-end sweep
+resumes the paused issue with a `focus_resumed` wake that carries your resume
+note. Do not treat `focus_preempted` as an error or restart the work yourself.
+
 ## Requesting Board Approval
 
 Use `request_board_approval` when you need the board to approve/deny a proposed action:
