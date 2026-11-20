@@ -49,6 +49,17 @@ describe("SSH command-managed argv", () => {
     const result = mode === "spawn" ? await (await runner()).execute(invocation) : await runSshCommand({ host: "fixture.invalid", port: 22, username: "fixture", remoteWorkspacePath: "/tmp", privateKey: null, knownHosts: null, strictHostKeyChecking: true }, 'printf "%s\\n" "$SENTINEL_TEXT"; cat', invocation);
     expect(result.stdout).toBe("fixture-credential\nprovider input\n");
   });
+  it.each(["spawn", "command"])("leads a new session and exports the run id through %s", async mode => {
+    const probe = 'sid=$(ps -o sid= -p $$ | tr -d " "); [ "$sid" = "$$" ] || exit 3; printf "%s %s\\n" "$PAPERCLIP_RUN_ID" "$sid"';
+    const invocation = { command: "sh", args: ["-c", probe], env: { PAPERCLIP_RUN_ID: "run-fixture" }, timeoutMs: 5000 };
+    const result = mode === "spawn"
+      ? await (await runner()).execute(invocation)
+      : await runSshCommand({ host: "fixture.invalid", port: 22, username: "fixture", remoteWorkspacePath: "/tmp", privateKey: null, knownHosts: null, strictHostKeyChecking: true }, probe, invocation);
+    const [runId, sid] = result.stdout.trim().split(/\s+/);
+    expect(runId).toBe("run-fixture");
+    expect(Number(sid)).toBeGreaterThan(0);
+  });
+
   it("delivers configured credentials without placing them in SSH process arguments and preserves provider stdin", async () => {
     const token = "selected-agent-subscription-canary";
     const result = await (await runner()).execute({ command: "sh", args: ["-c", 'printf "%s\\n" "$CLAUDE_CODE_OAUTH_TOKEN"; cat'],
