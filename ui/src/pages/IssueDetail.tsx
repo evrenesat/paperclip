@@ -11,7 +11,7 @@ import { AgentIdentity } from "@/components/AgentIdentity";
 import { clearLegacyChatMessageRequests } from "@/lib/chat-message-request";
 import { agentChatDraft } from "@/lib/agent-chat-draft";
 import { trackRecentProject } from "@/lib/recent-projects";
-import { Settings as ChatSettings } from "lucide-react";
+import { Settings as ChatSettings, Zap } from "lucide-react";
 import { agentDetailHref } from "./agent-detail-navigation";
 import { ExecutionBlockerNotice } from "../components/ExecutionBlockerNotice";
 import type { TaskComposerPause } from "../components/task-chat/TaskChatPausedTakeover";
@@ -232,6 +232,12 @@ import {
   TaskTreeControlDialog,
   TaskTreeControlMenuItems,
 } from "../components/TaskTreeControls";
+import {
+  AgentFocusStatusLine,
+  IssueDoNowSheet,
+  IssueFocusTargetBanner,
+  IssuePausedForFocusBanner,
+} from "../components/IssueDoNowSheet";
 import { waitForStoppedRuns } from "../lib/wait-for-stopped-runs";
 import { useIssueExternalObjects } from "../hooks/useIssueExternalObjects";
 import { IssueGalleryContext } from "../context/IssueGalleryContext";
@@ -1095,6 +1101,7 @@ interface InboxMobileToolbarProps {
   onCopy: () => void;
   onProperties: () => void;
   onHide: () => void;
+  onDoNow?: () => void;
 }
 
 function InboxMobileToolbar({
@@ -1107,6 +1114,7 @@ function InboxMobileToolbar({
   onCopy,
   onProperties,
   onHide,
+  onDoNow,
 }: InboxMobileToolbarProps) {
   const navigate = useNavigate();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -1171,6 +1179,18 @@ function InboxMobileToolbar({
               <SlidersHorizontal className="h-3 w-3" />
               Properties
             </button>
+            {onDoNow && (
+              <button
+                className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50"
+                onClick={() => {
+                  onDoNow();
+                  setMenuOpen(false);
+                }}
+              >
+                <Zap className="h-3 w-3" />
+                Do now
+              </button>
+            )}
             {issueIdProp && (
               <button
                 className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-destructive"
@@ -3582,6 +3602,45 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
     for (const a of agents ?? []) map.set(a.id, a);
     return map;
   }, [agents]);
+  const [doNowOpen, setDoNowOpen] = useState(false);
+  const assigneeAgent = issue?.assigneeAgentId
+    ? agentMap.get(issue.assigneeAgentId) ?? null
+    : null;
+  const { data: assigneeFocusState } = useQuery({
+    queryKey: queryKeys.agents.focus(assigneeAgent?.id ?? ""),
+    queryFn: () => agentsApi.getFocus(assigneeAgent!.id, resolvedCompanyId ?? undefined),
+    enabled: !!assigneeAgent && !!resolvedCompanyId,
+    refetchInterval: 5000,
+  });
+  const assigneeFocus = assigneeFocusState?.focus ?? null;
+  const endAssigneeFocus = useMutation({
+    mutationFn: () =>
+      assigneeAgent
+        ? agentsApi.endFocus(assigneeAgent.id, resolvedCompanyId ?? undefined)
+        : Promise.resolve({ ended: false }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.list(resolvedCompanyId ?? ""),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.agents.focus(assigneeAgent?.id ?? ""),
+      });
+    },
+  });
+  // The issue was paused by a Do now on the assignee's other task: the latest
+  // run was cancelled as focus_preempted and the focus is still active.
+  const focusDisplacedElsewhere =
+    !!assigneeFocus && !!issue?.id && assigneeFocus.issueId !== issue.id;
+  const { data: displacedRuns } = useQuery({
+    queryKey: queryKeys.issues.runs(issue?.id ?? ""),
+    queryFn: () => activityApi.runsForIssue(issue!.id),
+    enabled: focusDisplacedElsewhere,
+    refetchInterval: 5000,
+  });
+  const pausedForFocus =
+    focusDisplacedElsewhere &&
+    (issue?.status === "in_progress" || issue?.status === "todo") &&
+    (displacedRuns ?? []).some((run) => run.errorCode === "focus_preempted");
   const userProfileMap = useMemo(
     () => buildCompanyUserProfileMap(companyMembers?.users),
     [companyMembers?.users],
@@ -6338,6 +6397,7 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         onCopy={() => inboxToolbarCallbacksRef.current.onCopy()}
         onProperties={() => inboxToolbarCallbacksRef.current.onProperties()}
         onHide={() => inboxToolbarCallbacksRef.current.onHide()}
+        onDoNow={issue?.id ? () => setDoNowOpen(true) : undefined}
       />,
     );
 
@@ -7267,6 +7327,10 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
           userLabelMap={userLabelMap}
         />
 
+        {assigneeAgent && assigneeFocus && assigneeFocus.issueId !== issue.id ? (
+          <AgentFocusStatusLine focus={assigneeFocus} />
+        ) : null}
+
         {!streamlinedTaskDetailEnabled && (issue.labels ?? []).length > 0 && (
           <div className="hidden sm:flex items-center gap-1">
             {(issue.labels ?? []).slice(0, 4).map((label) => (
@@ -7429,6 +7493,16 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
                       )}
                       Copy as markdown
                     </button>
+                    <button
+                      className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/50"
+                      onClick={() => {
+                        setDoNowOpen(true);
+                        setMoreOpen(false);
+                      }}
+                    >
+                      <Zap className="h-3 w-3" />
+                      Do now
+                    </button>
                     {canArchiveFromInbox ? (
                       <button
                         className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-xs hover:bg-accent/50 disabled:opacity-50"
@@ -7535,6 +7609,20 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
         onCheckNow={() => checkIssueMonitorNow.mutate()}
         checkingNow={checkIssueMonitorNow.isPending}
       />
+
+      {assigneeAgent && assigneeFocus && assigneeFocus.issueId === issue.id ? (
+        <IssueFocusTargetBanner
+          agentName={assigneeAgent.name}
+          focus={assigneeFocus}
+        />
+      ) : null}
+      {pausedForFocus ? (
+        <IssuePausedForFocusBanner
+          focusIdentifier={assigneeFocus?.issueIdentifier ?? null}
+          pending={endAssigneeFocus.isPending}
+          onResume={() => endAssigneeFocus.mutate()}
+        />
+      ) : null}
 
       {taskChatShellEnabled ? null : (
         <InlineEditor
@@ -8351,6 +8439,22 @@ export function TaskDetailSurface({ conversation, tasksTab }: { tasksTab?: TaskS
               })
             }
           />
+
+          {/* Do now sheet */}
+          {issue && resolvedCompanyId ? (
+            <IssueDoNowSheet
+              open={doNowOpen}
+              onOpenChange={setDoNowOpen}
+              companyId={resolvedCompanyId}
+              issue={{
+                id: issue.id,
+                identifier: issue.identifier ?? null,
+                title: issue.title ?? null,
+              }}
+              agents={agents ?? []}
+              defaultAgentId={issue.assigneeAgentId ?? null}
+            />
+          ) : null}
 
           {/* Mobile properties drawer */}
           <Sheet open={mobilePropsOpen} onOpenChange={setMobilePropsOpen}>

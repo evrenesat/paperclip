@@ -99,6 +99,26 @@ export interface AgentWakeRequest {
   debug?: { providerTrace: "raw" };
 }
 
+export interface AgentFocusState {
+  focus: {
+    issueId: string;
+    issueIdentifier: string | null;
+    issueTitle: string | null;
+    startedAt: string | Date | null;
+    hasRun: boolean;
+  } | null;
+}
+
+export interface AgentFocusStartResult {
+  agentId: string;
+  focusIssueId: string;
+  focusStartedAt: string;
+  mode: "gracefully" | "right_away";
+  preemptedRunIds: string[];
+  steerAcknowledgedRunIds: string[];
+  pausedAgentIds: string[];
+}
+
 function withCompanyScope(path: string, companyId?: string) {
   if (!companyId) return path;
   const separator = path.includes("?") ? "&" : "?";
@@ -205,6 +225,15 @@ export const agentsApi = {
   retryLifecycle: (id: string, companyId?: string) => api.post<Agent>(agentPath(id, companyId, "/lifecycle/retry"), {}),
   pause: (id: string, companyId?: string) => api.post<Agent>(agentPath(id, companyId, "/pause"), {}),
   resume: (id: string, companyId?: string) => api.post<Agent>(agentPath(id, companyId, "/resume"), {}),
+  getFocus: (id: string, companyId?: string) =>
+    api.get<AgentFocusState>(agentPath(id, companyId, "/focus")),
+  focus: (
+    id: string,
+    input: { issueId: string; mode: "gracefully" | "right_away"; note?: string | null; pauseAgentIds?: string[] },
+    companyId?: string,
+  ) => api.post<AgentFocusStartResult>(agentPath(id, companyId, "/focus"), input),
+  endFocus: (id: string, companyId?: string) =>
+    api.delete<{ ended: boolean; resumedIssueIds?: string[] }>(agentPath(id, companyId, "/focus")),
   clearError: (id: string, companyId?: string) =>
     api.post<ClearAgentErrorResponse>(agentPath(id, companyId, "/clear-error"), {}),
   approve: (id: string, companyId?: string) => api.post<Agent>(agentPath(id, companyId, "/approve"), {}),

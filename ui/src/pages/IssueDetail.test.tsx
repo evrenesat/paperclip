@@ -91,12 +91,16 @@ const mockActivityApi = vi.hoisted(() => ({
 const mockHeartbeatsApi = vi.hoisted(() => ({
   get: vi.fn(),
   liveRunsForIssue: vi.fn(),
+  liveRunsForCompany: vi.fn(),
   activeRunForIssue: vi.fn(),
   cancel: vi.fn(),
 }));
 
 const mockAgentsApi = vi.hoisted(() => ({
   list: vi.fn(),
+  getFocus: vi.fn(),
+  focus: vi.fn(),
+  endFocus: vi.fn(),
 }));
 
 const mockAccessApi = vi.hoisted(() => ({
@@ -697,6 +701,9 @@ vi.mock("@/components/ui/sheet", () => ({
     <p>{children}</p>
   ),
   SheetTitle: ({ children }: { children?: ReactNode }) => <h2>{children}</h2>,
+  SheetFooter: ({ children }: { children?: ReactNode }) => (
+    <div>{children}</div>
+  ),
 }));
 
 vi.mock("@/components/ui/scroll-area", () => ({
@@ -1372,8 +1379,10 @@ describe("IssueDetail", () => {
     mockActivityApi.forIssue.mockResolvedValue([]);
     mockActivityApi.runsForIssue.mockResolvedValue([]);
     mockHeartbeatsApi.liveRunsForIssue.mockResolvedValue([]);
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
     mockHeartbeatsApi.activeRunForIssue.mockResolvedValue(null);
     mockAgentsApi.list.mockResolvedValue([]);
+    mockAgentsApi.getFocus.mockResolvedValue({ focus: null });
     mockAccessApi.getCurrentBoardAccess.mockResolvedValue({
       companyIds: ["company-1"],
       isInstanceAdmin: true,

@@ -1,6 +1,7 @@
 import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   heartbeatRuns,
@@ -693,7 +694,37 @@ export function agentFocusService(db: Db, deps: AgentFocusDeps) {
       .limit(1)
       .then((rows) => rows[0] ?? null);
     if (!agent) throw notFound("Agent not found");
-    if (!agent.focusIssueId) return { focus: null };
+    const lastEndedRow = await db
+      .select({ details: activityLog.details, createdAt: activityLog.createdAt })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, agent.companyId),
+          eq(activityLog.entityType, "agent"),
+          eq(activityLog.entityId, agent.id),
+          eq(activityLog.action, "agent.focus_ended"),
+        ),
+      )
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const lastEndedDetails = readObject(lastEndedRow?.details);
+    const lastEndedIssueId = readNonEmptyString(lastEndedDetails.issueId);
+    const lastEnded: {
+      at: Date;
+      outcome: string;
+      issueId: string;
+      issueIdentifier: string | null;
+    } | null =
+      lastEndedRow && lastEndedIssueId
+        ? {
+            at: lastEndedRow.createdAt,
+            outcome: readNonEmptyString(lastEndedDetails.outcome) ?? "ended",
+            issueId: lastEndedIssueId,
+            issueIdentifier: readNonEmptyString(lastEndedDetails.issueIdentifier),
+          }
+        : null;
+    if (!agent.focusIssueId) return { focus: null, lastEnded };
     const issue = await deps.issues.getById(agent.focusIssueId);
     const activeRun = issue
       ? (
@@ -718,6 +749,7 @@ export function agentFocusService(db: Db, deps: AgentFocusDeps) {
         startedAt: agent.focusStartedAt,
         hasRun: Boolean(activeRun),
       },
+      lastEnded,
     };
   }
 
