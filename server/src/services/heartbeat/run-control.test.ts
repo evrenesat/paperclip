@@ -27,7 +27,7 @@ import { issueService } from "../issues.js";
 import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
-import { acknowledgePreDispatchUserStop, acknowledgedNativeApiStopExecutionHasStopped } from "../acknowledged-native-stop.js";
+import { acknowledgePreDispatchStop, acknowledgedNativeApiStopExecutionHasStopped } from "../acknowledged-native-stop.js";
 import { nativeSha256 } from "../native-runtime/canonical.js";
 import { callbacks, runControlPostgresSupport, setupRunControlDatabase } from "./__tests__/run-control-fixtures.js";
 import { LEASE_RELEASE_FAST_ATTEMPTS, LEASE_RELEASE_SLOW_RETRY_MS } from "../environment-lease-release-deferral.js";
@@ -1085,8 +1085,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
   async function ownedAdapterRun() {
     const { company, agent } = await fixture();
     const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "running", runtimeMode: "legacy", runtimeModeResolvedAt: new Date(),
-      startedAt: new Date(), resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator-1" },
-      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } }).returning();
+      startedAt: new Date(), runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } } }).returning();
     const control = createAdapterExecutionControl();
     adapterExecutionControls.set(run.id, control);
     return { run, control };
@@ -1154,7 +1153,7 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
       // Production order: the setup owner acknowledges while the row is still
       // running, then teardown writes the terminal status before settlement.
-      expect(await acknowledgePreDispatchUserStop(db, run.id)).toBe(true);
+      expect(await acknowledgePreDispatchStop(db, run.id)).toMatchObject({ acknowledged: true, userStop: true });
       await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), error: "Operator Stop", errorCode: "operator_cancelled" })
         .where(eq(heartbeatRuns.id, run.id));
       control.finish();
@@ -1164,6 +1163,25 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
         .toMatchObject({ status: "cancelled", resultJson: {
           cancelledByActorType: "user", cancelledByUserId: "operator-1",
           executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch" } } });
+      expect(await agentExecutionStopBlocker(db, [run.agentId])).toBeNull();
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("accepts a pre-dispatch pause after the setup owner records its failure", async () => {
+    const { run, control } = await ownedAdapterRun();
+    try {
+      const stopping = createHeartbeatRunControl(db, callbacks(db)).cancelRunInternal(run.id, "Agent paused", {
+        errorCode: "agent_paused",
+      });
+      await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
+      expect(await acknowledgePreDispatchStop(db, run.id)).toMatchObject({ acknowledged: true, userStop: false });
+      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: "Agent paused", errorCode: "agent_paused" })
+        .where(eq(heartbeatRuns.id, run.id));
+      control.finish();
+      expect(await stopping).toMatchObject({ status: "failed", errorCode: "agent_paused" });
       expect(await agentExecutionStopBlocker(db, [run.agentId])).toBeNull();
     } finally {
       control.finish();
