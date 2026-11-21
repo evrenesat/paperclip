@@ -1222,7 +1222,10 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const [failed] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, failedLease.id));
     // The failed cleanup stays recorded: only the pending status is cleared.
     expect(failed).toMatchObject({ status: "released", cleanupStatus: "failed", failureReason: null });
-    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
+    // The attestation, not a false cleanup success, is what lifts the blocker.
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    await request(app(board)).post(url).send({ runId: run.id, leaseId: failedLease.id, note: "verified stopped" }).expect(200);
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
   });
 
   it("recovers an expired lease and never accepts an expired completion", async () => {

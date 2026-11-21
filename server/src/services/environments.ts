@@ -1744,10 +1744,17 @@ export function environmentService(db: Db) {
         failureReason?: string;
         cleanupStatus?: EnvironmentLeaseCleanupStatus;
         remoteExecutionTermination?: Record<string, unknown>;
+        operatorStopAttestation?: Record<string, unknown>;
+        requirePendingCleanup?: boolean;
       },
     ) => {
       const now = new Date();
-      const releaseMetadata = options?.remoteExecutionTermination
+      const releaseMetadata = options?.operatorStopAttestation
+        ? sql`(coalesce(${environmentLeases.metadata}, '{}'::jsonb) - 'remoteExecutionTermination') || ${JSON.stringify({
+            ...(options.remoteExecutionTermination ? { remoteExecutionTermination: options.remoteExecutionTermination } : {}),
+            operatorStopAttestation: options.operatorStopAttestation,
+          })}::jsonb`
+        : options?.remoteExecutionTermination
         ? sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ remoteExecutionTermination: options.remoteExecutionTermination })}::jsonb`
         : sql`${environmentLeases.metadata} - 'remoteExecutionTermination'`;
       const cleanupSettled = options?.expectedPendingCleanupAttemptId && options.cleanupStatus === "success"
@@ -1763,7 +1770,9 @@ export function environmentService(db: Db) {
             sql`${executionWorkspaces.metadata}->'remoteWorkspace'->'location'->>'leaseId' = ${id}`,
           )).orderBy(asc(executionWorkspaces.id)).for("update");
         }
-        const condition = and(eq(environmentLeases.id, id), options?.expectedPendingCleanupAttemptId
+        const condition = and(eq(environmentLeases.id, id),
+          options?.requirePendingCleanup ? eq(environmentLeases.status, "pending_cleanup") : undefined,
+          options?.expectedPendingCleanupAttemptId
           ? and(eq(environmentLeases.status, "pending_cleanup"),
               sql`${environmentLeases.metadata}->>'pendingCleanupAttemptId' = ${options.expectedPendingCleanupAttemptId}`)
           : undefined);

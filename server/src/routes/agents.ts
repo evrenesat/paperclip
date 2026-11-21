@@ -5993,17 +5993,40 @@ export function agentRoutes(
       return;
     }
     const now = new Date();
-    const [updated] = await db.update(environmentLeases).set({
-      ...(terminal ? {} : { status: "released", releasedAt: now }),
-      metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ operatorStopAttestation: attestation })}::jsonb`,
-      updatedAt: now,
-    }).where(and(
-      eq(environmentLeases.id, lease.id),
-      eq(environmentLeases.companyId, existing.companyId),
-      eq(environmentLeases.heartbeatRunId, run.id),
-      eq(environmentLeases.provider, "ssh"),
-      terminal ? inArray(environmentLeases.status, ["released", "expired", "failed"]) : eq(environmentLeases.status, "pending_cleanup"),
-    )).returning();
+    let updated: typeof lease | undefined;
+    if (terminal) {
+      [updated] = await db.update(environmentLeases).set({
+        metadata: sql`coalesce(${environmentLeases.metadata}, '{}'::jsonb) || ${JSON.stringify({ operatorStopAttestation: attestation })}::jsonb`,
+        updatedAt: now,
+      }).where(and(
+        eq(environmentLeases.id, lease.id),
+        eq(environmentLeases.companyId, existing.companyId),
+        eq(environmentLeases.heartbeatRunId, run.id),
+        eq(environmentLeases.provider, "ssh"),
+        inArray(environmentLeases.status, ["released", "expired", "failed"]),
+      )).returning();
+    } else {
+      // Releasing a pending_cleanup lease goes through the normal release path
+      // so deferred wakes and the remote workspace location settle exactly as a
+      // successful cleanup would. Cleanup status is left untouched: the
+      // attestation, not a fake success, is what lifts the pause blocker.
+      const released = await environmentService(db).releaseLease(lease.id, "released", {
+        requirePendingCleanup: true,
+        operatorStopAttestation: attestation,
+      });
+      if (released) updated = released as unknown as typeof lease;
+      else {
+        const [current] = await db.select().from(environmentLeases)
+          .where(and(eq(environmentLeases.id, lease.id), eq(environmentLeases.companyId, existing.companyId))).limit(1);
+        const currentStored = (current?.metadata as Record<string, unknown> | null)?.operatorStopAttestation;
+        if (current && currentStored && typeof currentStored === "object" &&
+            (currentStored as Record<string, unknown>).schema === "paperclip.operator-stop-attestation.v1" &&
+            (currentStored as Record<string, unknown>).leaseId === lease.id) {
+          res.json({ lease: current, attestation: currentStored });
+          return;
+        }
+      }
+    }
     if (!updated) {
       res.status(409).json({ error: "Lease changed while recording termination; reload and retry" });
       return;

@@ -22,7 +22,13 @@ export async function agentExecutionStopBlocker(db: Db, agentIds: string[]): Pro
   ));
   const deferred = leases.find(lease => lease.status === "active" && readLeaseReleaseDeferral(lease.metadata));
   if (deferred) return `environment_lease_release_deferred:${readLeaseReleaseDeferral(deferred.metadata)!.reason}`;
-  if (leases.some(lease => (!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed")) return "environment_lease_unreleased";
+  // An operator attestation is the documented exit for an SSH lease whose
+  // cleanup can never succeed (the host is gone). It replaces failed cleanup
+  // evidence only after the lease was released; hasOperatorStopAttestation
+  // already requires a released status and a bound attestation.
+  if (leases.some(lease => !hasOperatorStopAttestation(lease) &&
+      ((!lease.releasedAt && !(lease.status === "retained" && lease.cleanupStatus === "success")) ||
+        lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"))) return "environment_lease_unreleased";
   const coordinators = await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runIds));
   const now = new Date();
