@@ -1173,15 +1173,16 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
   it("accepts a pre-dispatch pause after the setup owner records its failure", async () => {
     const { run, control } = await ownedAdapterRun();
     try {
-      const stopping = createHeartbeatRunControl(db, callbacks(db)).cancelRunInternal(run.id, "Agent paused", {
-        errorCode: "agent_paused",
-      });
+      const stopping = createHeartbeatRunControl(db, callbacks(db))
+        .cancelActiveForAgentInternal(run.agentId, "Agent paused", "agent_paused");
       await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
       expect(await acknowledgePreDispatchStop(db, run.id)).toMatchObject({ acknowledged: true, userStop: false });
       await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: "Agent paused", errorCode: "agent_paused" })
         .where(eq(heartbeatRuns.id, run.id));
       control.finish();
-      expect(await stopping).toMatchObject({ status: "failed", errorCode: "agent_paused" });
+      await stopping;
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+        .toMatchObject({ status: "failed", errorCode: "agent_paused" });
       expect(await agentExecutionStopBlocker(db, [run.agentId])).toBeNull();
     } finally {
       control.finish();
