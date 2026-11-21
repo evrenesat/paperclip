@@ -720,13 +720,18 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
   });
 
-  it("still records a pre-dispatch pause as a setup failure", async () => {
+  it("keeps the pause owner's error and code on a pre-dispatch setup stop", async () => {
     const f = await fixture();
+    // The Stop owner writes these before aborting the control.
+    await db.update(heartbeatRuns).set({ error: "Agent paused", errorCode: "agent_paused" })
+      .where(eq(heartbeatRuns.id, f.run.id));
     f.controller.abort(new Error("Agent paused"));
     await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
-    expect(await read(f.run.id)).toMatchObject({ status: "failed", resultJson: {
-      executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch" } } });
-    expect(f.deps.setRunStatusIfRunning).toHaveBeenCalled();
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", error: "Agent paused",
+      errorCode: "agent_paused", resultJson: {
+        executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch" } } });
+    expect(f.deps.setRunStatusIfRunning.mock.calls[0]?.slice(0, 3)).toEqual([f.run.id, "failed",
+      expect.objectContaining({ error: "Agent paused", errorCode: "agent_paused" })]);
   });
 
   it("keeps a stop requested before the lease loss when the adapter throws", async () => {

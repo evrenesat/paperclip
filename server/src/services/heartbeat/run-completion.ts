@@ -1601,6 +1601,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const controllerLeaseLost = !providerDispatchStarted &&
       signal.reason instanceof LegacyControllerLeaseLostError;
     let preDispatchStopAcknowledgedAt: string | null = null;
+    let preDispatchStopError: string | null = null;
+    let preDispatchStopErrorCode: string | null = null;
     // Any Stop that lands during setup aborts the control before provider work
     // starts. No adapter can acknowledge it, but no remote work exists either,
     // so record the acknowledgement here. A user Stop then leaves the run for
@@ -1609,7 +1611,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // termination conflict. Shutdown and lease loss settle elsewhere.
     if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted) {
       const preDispatchStop = await acknowledgePreDispatchStop(db, runId).catch(() => null);
-      if (preDispatchStop?.acknowledged) preDispatchStopAcknowledgedAt = preDispatchStop.acknowledgedAt;
+      if (preDispatchStop?.acknowledged) {
+        preDispatchStopAcknowledgedAt = preDispatchStop.acknowledgedAt;
+        preDispatchStopError = preDispatchStop.error;
+        preDispatchStopErrorCode = preDispatchStop.errorCode;
+      }
       if (preDispatchStop?.userStop) {
         logger.info(
           { runId, errorKind: "setup_stopped_before_provider_start" },
@@ -1627,12 +1633,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const thrownFailureCause = failureCauseFromError(outerErr, providerFailure);
     // A lost controller lease takes the code below and its own retry, so only a
     // `storage_unavailable` failure carries the storage wait's text.
-    const message = storageUnavailable && !controllerLeaseLost ? storageUnavailableMessage(outerErr) : withoutSqlStatementText(redactCurrentUserText(
+    const message = preDispatchStopError ?? (storageUnavailable && !controllerLeaseLost ? storageUnavailableMessage(outerErr) : withoutSqlStatementText(redactCurrentUserText(
       identityRedactor.redact(outerErr instanceof Error
         ? outerErr.message
         : "Unknown setup failure"),
       currentUserRedactionOptions,
-    ), thrownFailureCause);
+    ), thrownFailureCause));
     // A missing secret/env binding is a known pre-dispatch configuration gap,
     // not an opaque setup crash. Surface it with its own errorCode so the
     // recovery path routes it to a human owner instead of looping retries.
@@ -1695,6 +1701,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     const runnerRevisionMismatch = !providerDispatchStarted && run.runtimeMode === "legacy"
       && run.nativeSessionId === null && run.runnerInstanceId === null && isRunnerRevisionMismatch(outerErr);
     const setupFailureErrorCode =
+      preDispatchStopErrorCode ??
       (controllerLeaseLost ? CONTROLLER_LEASE_LOST_FAILURE_CODE : null) ??
       (storageUnavailable ? STORAGE_UNAVAILABLE_CODE : null) ??
       remoteWorkspacePreparationTimeout?.code ??

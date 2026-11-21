@@ -58,6 +58,7 @@ export function recordedUserStopRequestSql() {
  * owner; pause and budget stops still write their own failure status. */
 export async function acknowledgePreDispatchStop(db: Db, runId: string): Promise<{
   acknowledged: boolean; userStop: boolean; acknowledgedAt: string;
+  error: string | null; errorCode: string | null;
 }> {
   const acknowledgedAt = new Date();
   const [acknowledged] = await db.update(heartbeatRuns).set({
@@ -74,10 +75,14 @@ export async function acknowledgePreDispatchStop(db: Db, runId: string): Promise
     )`,
     updatedAt: acknowledgedAt,
   }).where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running")))
-    .returning({ id: heartbeatRuns.id, userStop: sql<boolean>`${recordedUserStopRequestSql()}` });
+    .returning({ id: heartbeatRuns.id, userStop: sql<boolean>`${recordedUserStopRequestSql()}`,
+      error: heartbeatRuns.error, errorCode: heartbeatRuns.errorCode });
   return {
     acknowledged: Boolean(acknowledged), userStop: acknowledged?.userStop === true,
     acknowledgedAt: acknowledgedAt.toISOString(),
+    // The Stop owner wrote its own reason and code before aborting the control.
+    // Pause and budget Stops keep them instead of becoming a generic setup failure.
+    error: acknowledged?.error ?? null, errorCode: acknowledged?.errorCode ?? null,
   };
 }
 
