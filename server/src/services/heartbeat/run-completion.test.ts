@@ -724,7 +724,8 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     const f = await fixture();
     f.controller.abort(new Error("Agent paused"));
     await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
-    expect(await read(f.run.id)).toMatchObject({ status: "failed" });
+    expect(await read(f.run.id)).toMatchObject({ status: "failed", resultJson: {
+      executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch" } } });
     expect(f.deps.setRunStatusIfRunning).toHaveBeenCalled();
   });
 

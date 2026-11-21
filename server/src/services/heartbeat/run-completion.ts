@@ -33,7 +33,7 @@ import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure }
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { cancellationResultJson, controllerLeaseLossCancellation, readRunCancellation } from "../run-cancellation.js";
-import { acknowledgePreDispatchUserStop } from "../acknowledged-native-stop.js";
+import { acknowledgePreDispatchStop } from "../acknowledged-native-stop.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { REVIEWED_CHAT_BINDING_NOT_READY, ReviewedChatBindingNotReadyError, reviewedChatBindingDenialResultJson } from "../reviewed-chat-binding-diagnostics.js";
 import { reportRunFailure } from "../run-failure-report.js";
@@ -1600,19 +1600,23 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // capture write), so only a stop before dispatch is a retryable lease loss.
     const controllerLeaseLost = !providerDispatchStarted &&
       signal.reason instanceof LegacyControllerLeaseLostError;
-    // A user Stop that lands during setup aborts the control before any
-    // provider work starts. No adapter can acknowledge it, but no remote work
-    // exists either, so record the acknowledgement here and let the Stop
-    // terminalize the run as `cancelled`. A `failed` write would report an
-    // unverifiable termination. Pauses and budget stops keep the failure so
-    // their own error codes survive; shutdown and lease loss settle elsewhere.
-    if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted &&
-        await acknowledgePreDispatchUserStop(db, runId).catch(() => false)) {
-      logger.info(
-        { runId, errorKind: "setup_stopped_before_provider_start" },
-        "setup stopped before provider start; leaving cancellation settlement to the stop owner",
-      );
-      return;
+    let preDispatchStopAcknowledgedAt: string | null = null;
+    // Any Stop that lands during setup aborts the control before provider work
+    // starts. No adapter can acknowledge it, but no remote work exists either,
+    // so record the acknowledgement here. A user Stop then leaves the run for
+    // the Stop owner to terminalize as `cancelled`. A pause or budget Stop still
+    // writes `failed` so its own error code survives, without an unverifiable
+    // termination conflict. Shutdown and lease loss settle elsewhere.
+    if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted) {
+      const preDispatchStop = await acknowledgePreDispatchStop(db, runId).catch(() => null);
+      if (preDispatchStop?.acknowledged) preDispatchStopAcknowledgedAt = preDispatchStop.acknowledgedAt;
+      if (preDispatchStop?.userStop) {
+        logger.info(
+          { runId, errorKind: "setup_stopped_before_provider_start" },
+          "setup stopped before provider start; leaving cancellation settlement to the stop owner",
+        );
+        return;
+      }
     }
     // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
     // The inner catch did not fire, so we must record the failure here.
@@ -1774,6 +1778,10 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         step: remoteWorkspaceRestoreFailure.step, retryable: remoteWorkspaceRestoreFailure.retryable } } : {}),
       ...(!providerDispatchStarted
         ? { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } }
+        : {}),
+      ...(preDispatchStopAcknowledgedAt
+        ? { executionCancellation: { state: "acknowledged", acknowledgedAt: preDispatchStopAcknowledgedAt,
+          proof: "no_provider_dispatch" } }
         : {}),
       ...(!providerDispatchStarted && !signal.aborted
         ? await nativePreDispatchFailureResult(runId, nativeDispatchMayHaveStarted) : null),
