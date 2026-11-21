@@ -1193,7 +1193,6 @@ function createLocalEnvironmentDriver(db: Db): EnvironmentRuntimeDriver {
         metadata: {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
-          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
         },
       });
@@ -2165,7 +2164,6 @@ function createSandboxEnvironmentDriver(
         const pluginLeaseMetadata = {
           ...(input.agentId ? { agentId: input.agentId } : {}),
           driver: input.environment.driver,
-          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: pluginProvider.resolved.plugin.id,
           pluginKey: pluginProvider.resolved.plugin.pluginKey,
@@ -3744,7 +3742,6 @@ function createPluginEnvironmentDriver(
           environmentId: input.environment.id,
           ...(input.purpose !== "login" && input.adapterType === "paperclip_runner" && driver.supportsTasks === true ? { runnerTaskLease: true } : {}),
           driver: input.environment.driver,
-          remoteStopContract: SSH_REMOTE_STOP_CONTRACT,
           executionWorkspaceMode: input.executionWorkspaceMode,
           pluginId: plugin.id,
           pluginKey: parsed.config.pluginKey,

@@ -1440,12 +1440,16 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           await control.settled;
           await finishLegacyShutdownWorkspaceSettlement(db, run);
         }
+        const hasSshLease = async (runId: string) => Boolean((await db.select({ id: environmentLeases.id })
+          .from(environmentLeases).where(and(eq(environmentLeases.heartbeatRunId, runId),
+            eq(environmentLeases.provider, "ssh"))).limit(1))[0]);
         if (!interruptedStatus.updated || !interruptedStatus.run) {
           if (control) {
             const current = await getRun(run.id, { includeExecutionEvidence: true });
             if (current && HEARTBEAT_RUN_TERMINAL_STATUSES.some(status => status === current.status)) {
               await releaseEnvironmentLeasesForRun({ runId: current.id, companyId: current.companyId,
-                agentId: current.agentId, status: current.status, failureReason: current.error ?? undefined });
+                agentId: current.agentId, status: current.status, failureReason: current.error ?? undefined,
+                ...(current.status !== "succeeded" && await hasSshLease(current.id) ? { cancelActiveWork: true } : {}) });
             }
           }
           return;
@@ -1468,6 +1472,8 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
           agentId: interrupted.agentId,
           status: interrupted.status,
           failureReason: interrupted.error ?? undefined,
+          ...(interrupted.status !== "succeeded" && await hasSshLease(interrupted.id)
+            ? { cancelActiveWork: true } : {}),
         });
 
         const retry = await enqueueProcessLossRetry(interrupted, agent, now);
@@ -1710,6 +1716,10 @@ export function createHeartbeatRecovery(db: Db, dependencies: HeartbeatRecoveryD
     }
     await releaseEnvironmentLeasesForRun({ runId: run.id, companyId: run.companyId, agentId: run.agentId,
       status: run.status, failureReason: run.error ?? undefined,
+      // A crash or restart leaves the remote command alive after the SSH
+      // client dies. Stop it before releasing the lease, except when the run
+      // succeeded and nothing can still be running.
+      ...(strandedSshLease && run.status !== "succeeded" ? { cancelActiveWork: true } : {}),
       providerResourceDisposition: deferral ? deferral.providerResourceDisposition ?? undefined : "destroy" });
     const [after] = await db.select({ status: environmentLeases.status, metadata: environmentLeases.metadata })
       .from(environmentLeases).where(eq(environmentLeases.id, lease.id));

@@ -730,6 +730,35 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
     });
   });
 
+  it("stops an interrupted SSH run before releasing its lease", async () => {
+    const { runId, leaseId } = await seedTerminalSshLease({ status: "interrupted" });
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ recovered: 1 });
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ PAPERCLIP_STOP_RUN_ID: runId }) }));
+    expect(await leaseRow(leaseId)).toMatchObject({ status: "released", cleanupStatus: "success" });
+    expect((await leaseRow(leaseId))?.metadata?.remoteExecutionTermination).toMatchObject({
+      runId, leaseId, provider: "ssh", state: "stopped",
+    });
+  });
+
+  it("keeps an interrupted SSH lease pending when the stop cannot be proven", async () => {
+    const { runId, leaseId } = await seedTerminalSshLease({ status: "interrupted" });
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=1\n", stderr: "" }));
+    setSshRunStopRunnerForTests(runner);
+
+    const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
+
+    expect(result).toEqual({ recovered: 1 });
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ PAPERCLIP_STOP_RUN_ID: runId }) }));
+    const row = await leaseRow(leaseId);
+    expect(row).toMatchObject({ status: "pending_cleanup", cleanupStatus: "failed", failureReason: "ssh_remote_stop_failed" });
+    expect(row?.metadata?.remoteExecutionTermination).toBeUndefined();
+  });
+
   it("leaves the SSH lease to this boot while the run is still in process", async () => {
     const { runId, leaseId } = await seedTerminalSshLease();
     adapterExecutionControls.set(runId, createAdapterExecutionControl());
