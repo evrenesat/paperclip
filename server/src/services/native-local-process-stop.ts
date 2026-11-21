@@ -6,7 +6,7 @@ import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@
 import { notifyRetainedNativeSessionCleanup } from "./retained-native-session-cleanup-notifications.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
-import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasOperatorStopAttestation, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { NATIVE_SESSION_PROVIDER_EVENT_TYPES } from "./native-runtime/native-session-resume.js";
 import os from "node:os";
 import { currentProcessSpaceHash, UNKNOWN_PROCESS_SPACE } from "./controller-process-identity.js";
@@ -478,7 +478,7 @@ export async function inspectSettledNativeRunProcess(db: Db, runId: string, opti
       const leases = await tx.select().from(environmentLeases).where(and(
         eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, runId),
       ));
-      if (!leases.every(hasRemoteTerminationReceipt)) return "pending";
+      if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasOperatorStopAttestation(lease))) return "pending";
     } else {
       if (run.localLeasePending) return "pending";
       if (run.identityMatches !== true) return "skipped";

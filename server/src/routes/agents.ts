@@ -5953,8 +5953,10 @@ export function agentRoutes(
       res.status(404).json({ error: "Run not found for this agent" });
       return;
     }
-    if (run.status !== "cancelled") {
-      res.status(409).json({ error: "Only a cancelled run can be recorded as remotely stopped" });
+    // A run can fail or time out because its host is gone; that is exactly when
+    // the person needs this exit. Only finished runs can carry the attestation.
+    if (!["cancelled", "failed", "timed_out", "interrupted"].includes(run.status)) {
+      res.status(409).json({ error: "Only a finished run can be recorded as remotely stopped" });
       return;
     }
     const [lease] = await db.select().from(environmentLeases)

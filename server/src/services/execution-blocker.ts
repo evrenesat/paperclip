@@ -13,7 +13,7 @@ import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js
 import { EXECUTION_RECONCILIATION_CAUSES, readRunFailureCause, withoutSqlStatementText, type ExecutionBlocker } from "@paperclipai/shared";
 import { hasRequiredWorkspaceRecovery, LEGACY_WORKSPACE_RECOVERY_SCHEMA, nativeRunHasNoWorkspaceAccess } from "./workspace-restore-recovery-state.js";
 import { unreconciledNativeExportPredicate } from "./native-runtime/native-workspace-reconstruction.js";
-import { hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
+import { hasOperatorStopAttestation, hasRecoveredCleanupStopReceipt, hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { completedWorkspaceRecoveryCondition, hasVerifiedWorkspaceRepair, recoveredWorkMessage, savedWorkOffersRetry, workspaceRecoveryDisplay } from "./workspace-recovery-receipt.js";
 import { nativeManualAdmissionHoldsExecution } from "./native-runtime/native-runner-ownership.js";
@@ -81,10 +81,15 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
   if (await nativeManualAdmissionHoldsExecution(db, { companyId, runId })) return true;
   // Recovery saved the files and re-stopped this sandbox before queueing its
   // destroy. That destroy is resource cleanup, not a live owner of the run.
-  const recoveredStopped = (await db.select().from(environmentLeases).where(and(
+  const runLeases = await db.select().from(environmentLeases).where(and(
     eq(environmentLeases.companyId, companyId), eq(environmentLeases.heartbeatRunId, runId),
-    sql`${environmentLeases.metadata}->'workspaceRecoveryCleanup' is not null`,
-  ))).filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
+  ));
+  const recoveredStopped = runLeases.filter(lease => lease.metadata?.workspaceRecoveryCleanup != null)
+    .filter(hasRecoveredCleanupStopReceipt).map(lease => lease.id);
+  // An operator attestation is the exit for an SSH lease whose cleanup can
+  // never succeed (the host is gone). The released lease still records failed
+  // cleanup, so it must not keep the run's successor queued behind it.
+  const settled = [...recoveredStopped, ...runLeases.filter(hasOperatorStopAttestation).map(lease => lease.id)];
   // A missing predecessor row owns nothing: deleting a run nulls its leases'
   // run reference and removes its finalization coordinator. Failing closed on
   // absence stranded the successor with no next action (invariants 3 and 7).
@@ -93,7 +98,7 @@ export async function hasPendingRunCleanup(db: Db, companyId: string, runId: str
     ${heartbeatRuns.runnerProfileJson}->>'nativeWorkspaceFinalizationOwner' IS NOT NULL
     OR EXISTS (SELECT 1 FROM ${environmentLeases}
       WHERE ${environmentLeases.companyId} = ${companyId} AND ${environmentLeases.heartbeatRunId} = ${runId}
-        ${recoveredStopped.length ? sql`AND ${environmentLeases.id}::text NOT IN (${sql.join(recoveredStopped.map(id => sql`${id}`), sql`, `)})` : sql``}
+        ${settled.length ? sql`AND ${environmentLeases.id}::text NOT IN (${sql.join(settled.map(id => sql`${id}`), sql`, `)})` : sql``}
         AND (( ${environmentLeases.releasedAt} IS NULL AND NOT COALESCE(
             ${environmentLeases.status} = 'retained' AND ${environmentLeases.leasePolicy} = 'reuse_by_environment'
               AND ${environmentLeases.cleanupStatus} = 'success', false))

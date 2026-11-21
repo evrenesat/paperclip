@@ -7,6 +7,7 @@ import { deleteCompany } from "../../../services/company-deletion.js";
 import { agentLifecycleCompanyDeletion } from "../company-deletion.js";
 import { requireServerAdapter } from "../../../adapters/index.js";
 import { agentExecutionsHaveStopped, agentExecutionStopBlocker } from "../../../services/agent-execution-stop.js";
+import { hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { remoteTerminationReceipt } from "../../../services/remote-execution-termination.js";
 import { approvalService } from "../../../services/approvals.js";
 import { updateAgentConfigurationInTransaction } from "../../../services/agent-configuration-transaction.js";
@@ -1210,11 +1211,13 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
       provider: "ssh", providerLeaseId: "ssh://host/workdir", status: "pending_cleanup", cleanupStatus: "success" }).returning();
     const url = `/api/agents/${agent.id}/lifecycle/record-remote-termination`;
     expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
+    expect(await hasPendingRunCleanup(db, companyId, run.id)).toBe(true);
     await request(app(board)).post(url).send({ runId: run.id, leaseId: lease.id, note: "cleanup could not run" }).expect(200);
     const [released] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, lease.id));
     expect(released).toMatchObject({ status: "released", cleanupStatus: "success" });
     expect(released!.releasedAt).toBeInstanceOf(Date);
     expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    expect(await hasPendingRunCleanup(db, companyId, run.id)).toBe(false);
 
     const [failedLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: run.id,
       provider: "ssh", providerLeaseId: "ssh://host/workdir-2", status: "pending_cleanup", cleanupStatus: "failed" }).returning();
@@ -1222,10 +1225,22 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     const [failed] = await db.select().from(environmentLeases).where(eq(environmentLeases.id, failedLease.id));
     // The failed cleanup stays recorded: only the pending status is cleared.
     expect(failed).toMatchObject({ status: "released", cleanupStatus: "failed", failureReason: null });
-    // The attestation, not a false cleanup success, is what lifts the blocker.
+    // The attestation, not a false cleanup success, is what lifts the blocker
+    // and lets the run's successor past issue admission.
     expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    expect(await hasPendingRunCleanup(db, companyId, run.id)).toBe(false);
     await request(app(board)).post(url).send({ runId: run.id, leaseId: failedLease.id, note: "verified stopped" }).expect(200);
     expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+
+    // A failed run whose host is gone has the same operator exit.
+    const [failedRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: agent.id, status: "failed",
+      invocationSource: "on_demand", runtimeMode: "legacy", startedAt: new Date(), finishedAt: new Date() }).returning();
+    const [failedRunLease] = await db.insert(environmentLeases).values({ companyId, heartbeatRunId: failedRun.id,
+      provider: "ssh", providerLeaseId: "ssh://host/workdir-3", status: "pending_cleanup", cleanupStatus: "failed" }).returning();
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBe("environment_lease_unreleased");
+    await request(app(board)).post(url).send({ runId: failedRun.id, leaseId: failedRunLease.id, note: "host decommissioned" }).expect(200);
+    expect(await agentExecutionStopBlocker(db, [agent.id])).toBeNull();
+    expect(await hasPendingRunCleanup(db, companyId, failedRun.id)).toBe(false);
   });
 
   it("recovers an expired lease and never accepts an expired completion", async () => {
