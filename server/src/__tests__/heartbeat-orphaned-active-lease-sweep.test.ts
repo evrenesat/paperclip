@@ -716,14 +716,14 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("stops the remote work of another boot's cancelled SSH run", async () => {
     const { runId, leaseId } = await seedTerminalSshLease();
-    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
     setSshRunStopRunnerForTests(runner);
 
     const result = await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
 
     expect(result).toEqual({ recovered: 1 });
     expect(runner).toHaveBeenCalledOnce();
-    expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ PAPERCLIP_STOP_RUN_ID: runId }) }));
     expect(await leaseRow(leaseId)).toMatchObject({ status: "expired", cleanupStatus: "success" });
     expect((await leaseRow(leaseId))?.metadata?.remoteExecutionTermination).toMatchObject({
       runId, leaseId, provider: "ssh", state: "stopped",
@@ -733,7 +733,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
   it("leaves the SSH lease to this boot while the run is still in process", async () => {
     const { runId, leaseId } = await seedTerminalSshLease();
     adapterExecutionControls.set(runId, createAdapterExecutionControl());
-    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
     setSshRunStopRunnerForTests(runner);
 
     expect(await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 0 });
@@ -743,7 +743,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("does not race this boot's own release of an SSH run", async () => {
     const { leaseId } = await seedTerminalSshLease({ controllerBootId: legacyControllerBootId });
-    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
     setSshRunStopRunnerForTests(runner);
 
     await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 });
@@ -757,7 +757,7 @@ describeEmbeddedPostgres("heartbeat sweepOrphanedActiveLeases", () => {
 
   it("skips an SSH lease whose run is still non-terminal", async () => {
     const { leaseId } = await seedTerminalSshLease({ status: "running" });
-    const runner = vi.fn(async () => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
+    const runner = vi.fn(async (_input: { env: Record<string, string> }) => ({ stdout: "paperclip-ssh-run-stop matched=1 remaining=0\n", stderr: "" }));
     setSshRunStopRunnerForTests(runner);
 
     expect(await heartbeatService(db).sweepOrphanedActiveLeases({ backoffMs: 0 })).toEqual({ recovered: 0 });
