@@ -33,6 +33,7 @@ import { CONFIGURATION_INCOMPLETE_FAILURE_CODE, ConfigurationIncompleteFailure }
 import { isWorkspaceValidationFailedRun, isWorkspaceValidationFailure, attachPaperclipSessionMetadataToSessionParams } from "./workspaces.js";
 import { preserveWorkspaceRestoreRecoveryMetadataSql } from "../legacy-workspace-restore-recovery.js";
 import { cancellationResultJson, controllerLeaseLossCancellation, readRunCancellation } from "../run-cancellation.js";
+import { acknowledgePreDispatchUserStop } from "../acknowledged-native-stop.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE, LegacyControllerLeaseLostError } from "../legacy-controller-lease.js";
 import { REVIEWED_CHAT_BINDING_NOT_READY, ReviewedChatBindingNotReadyError, reviewedChatBindingDenialResultJson } from "../reviewed-chat-binding-diagnostics.js";
 import { reportRunFailure } from "../run-failure-report.js";
@@ -1599,11 +1600,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // capture write), so only a stop before dispatch is a retryable lease loss.
     const controllerLeaseLost = !providerDispatchStarted &&
       signal.reason instanceof LegacyControllerLeaseLostError;
-    // A Stop that lands during setup aborts the control before any provider
-    // work starts. The Stop owner records the acknowledged cancellation; a
-    // `failed` write here would make that Stop report an unverifiable
-    // termination. Shutdown and lease loss settle through their own paths.
-    if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted) {
+    // A user Stop that lands during setup aborts the control before any
+    // provider work starts. No adapter can acknowledge it, but no remote work
+    // exists either, so record the acknowledgement here and let the Stop
+    // terminalize the run as `cancelled`. A `failed` write would report an
+    // unverifiable termination. Pauses and budget stops keep the failure so
+    // their own error codes survive; shutdown and lease loss settle elsewhere.
+    if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted &&
+        await acknowledgePreDispatchUserStop(db, runId).catch(() => false)) {
       logger.info(
         { runId, errorKind: "setup_stopped_before_provider_start" },
         "setup stopped before provider start; leaving cancellation settlement to the stop owner",

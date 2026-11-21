@@ -702,16 +702,30 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         deadlineLateMs: 55_000, renewalCount: 3 } } });
   });
 
-  it("leaves a pre-dispatch Stop to the cancellation owner instead of recording a setup failure", async () => {
+  it("acknowledges a pre-dispatch user Stop and leaves the terminal write to the stop owner", async () => {
     const f = await fixture();
-    const resultJson = { cleanup: { status: "pending_cleanup", evidence: "keep" } };
+    const resultJson = { cleanup: { status: "pending_cleanup", evidence: "keep" },
+      cancelledByActorType: "user", cancelledByUserId: "operator-1",
+      executionCancellation: { state: "requested", requestedAt: "2026-11-21T10:00:00.000Z" } };
     await db.update(heartbeatRuns).set({ resultJson }).where(eq(heartbeatRuns.id, f.run.id));
     f.controller.abort(new Error("Stopped from the board"));
     await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
-    expect(await read(f.run.id)).toMatchObject({ status: "running", error: null, errorCode: null, resultJson });
+    expect(await read(f.run.id)).toMatchObject({ status: "running", error: null, errorCode: null, resultJson: {
+      cleanup: { status: "pending_cleanup", evidence: "keep" },
+      cancelledByActorType: "user", cancelledByUserId: "operator-1",
+      executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch",
+        acknowledgedAt: expect.any(String), requestedAt: "2026-11-21T10:00:00.000Z" } } });
     expect(f.deps.setRunStatusIfRunning).not.toHaveBeenCalled();
     expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
+  it("still records a pre-dispatch pause as a setup failure", async () => {
+    const f = await fixture();
+    f.controller.abort(new Error("Agent paused"));
+    await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
+    expect(await read(f.run.id)).toMatchObject({ status: "failed" });
+    expect(f.deps.setRunStatusIfRunning).toHaveBeenCalled();
   });
 
   it("keeps a stop requested before the lease loss when the adapter throws", async () => {
