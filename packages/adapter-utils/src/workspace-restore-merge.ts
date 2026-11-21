@@ -705,6 +705,35 @@ export async function selectDirectorySnapshot(snapshot: DirectorySnapshot, optio
   }
 }
 
+/** A disk-backed subset that drops entries by predicate. Like
+ * {@link selectDirectorySnapshot}, the result owns its manifest directory and
+ * must be disposed by its consumer. */
+export async function filterDirectorySnapshot(snapshot: DirectorySnapshot, options: {
+  drop?: (relative: string) => boolean;
+  exclude?: string[];
+  ignoredPaths?: WorkspacePaths;
+}): Promise<DirectorySnapshot> {
+  const writer = await createWorkspaceManifest("paperclip-workspace-baseline-");
+  try {
+    for (const [relative, entry] of snapshot.entries) {
+      if (options.drop?.(relative)) continue;
+      writer.add("baseline", relative, JSON.stringify(entry));
+    }
+    const result: DirectorySnapshot = {
+      exclude: [...(options.exclude ?? snapshot.exclude)],
+      ignoredPaths: options.ignoredPaths ?? snapshot.ignoredPaths,
+      entries: new WorkspaceManifestMap(writer.paths("baseline"), parseManifestEntry),
+    };
+    writer.close();
+    ownedDirectorySnapshots.set(result, path.dirname(writer.filePath));
+    return result;
+  } catch (error) {
+    writer.close(false);
+    await fs.rm(path.dirname(writer.filePath), { recursive: true, force: true });
+    throw error;
+  }
+}
+
 function orderedEntries(snapshot: DirectorySnapshot, reverse = false): Iterable<[string, SnapshotEntry]> {
   if (snapshot.entries instanceof WorkspaceManifestMap) return snapshot.entries.entries(reverse);
   return [...snapshot.entries].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0) * (reverse ? -1 : 1));
