@@ -23,6 +23,7 @@ import {
   sshRunStopScript,
 } from "../services/ssh-run-stop.js";
 import { remoteTerminationReceipt } from "../services/remote-execution-termination.js";
+import type { Environment, EnvironmentLease } from "@paperclipai/shared";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -231,7 +232,7 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     const released = await environmentRuntimeService(db).releaseRunLeases(runId, "expired");
     expect(released).toHaveLength(1);
     expect(runner).toHaveBeenCalledOnce();
-    expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ PAPERCLIP_STOP_RUN_ID: runId }) }));
 
     const row = await leaseRow(leaseId);
     expect(row).toMatchObject({ status: "expired", cleanupStatus: "success" });
@@ -317,14 +318,14 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     expect(lease).not.toBeNull();
 
     await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
-      environment: environment ?? null,
-      lease: lease!,
+      environment: (environment ?? null) as Environment | null,
+      lease: lease as unknown as EnvironmentLease,
     })).resolves.toEqual({
       providerLeaseId: "ssh://ssh.example.test/workspace",
       state: "stopped",
     });
     expect(runner).toHaveBeenCalledOnce();
-    expect(runner.mock.calls[0][0].env).toMatchObject({ PAPERCLIP_STOP_RUN_ID: runId });
+    expect(runner).toHaveBeenCalledWith(expect.objectContaining({ env: expect.objectContaining({ PAPERCLIP_STOP_RUN_ID: runId }) }));
   });
 
   it("keeps a pending_cleanup lease failed when the retry cannot prove the stop", async () => {
@@ -340,8 +341,8 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     const lease = await leaseRow(leaseId);
 
     await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
-      environment: environment ?? null,
-      lease: lease!,
+      environment: (environment ?? null) as Environment | null,
+      lease: lease as unknown as EnvironmentLease,
     })).rejects.toThrow("ssh unreachable");
     expect(await leaseRow(leaseId)).toMatchObject({
       status: "pending_cleanup",
@@ -369,8 +370,8 @@ describeEmbeddedPostgres("SSH lease release stops remote work", () => {
     const lease = await leaseRow(leaseId);
 
     await expect(environmentRuntimeService(db).retryPendingSandboxTeardown({
-      environment: environment ?? null,
-      lease: lease!,
+      environment: (environment ?? null) as Environment | null,
+      lease: lease as unknown as EnvironmentLease,
     })).resolves.toEqual({
       providerLeaseId: "ssh://ssh.example.test/workspace",
       state: "stopped",
