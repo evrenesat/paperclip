@@ -32,6 +32,7 @@ import { nativeSha256 } from "../native-runtime/canonical.js";
 import { callbacks, runControlPostgresSupport, setupRunControlDatabase } from "./__tests__/run-control-fixtures.js";
 import { LEASE_RELEASE_FAST_ATTEMPTS, LEASE_RELEASE_SLOW_RETRY_MS } from "../environment-lease-release-deferral.js";
 import { agentExecutionStopBlocker } from "../agent-execution-stop.js";
+import { isOperatorStoppedRunRow } from "../../modules/wake-queue/adapters/postgres.js";
 
 vi.mock("../live-events.js", () => ({ publishLiveEvent: vi.fn() }));
 vi.mock("../acknowledged-native-stop.js", async (importOriginal) => {
@@ -1170,19 +1171,22 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     }
   });
 
-  it("accepts a pre-dispatch pause after the setup owner records its failure", async () => {
+  it("accepts a pre-dispatch pause after the setup owner records its cancellation", async () => {
     const { run, control } = await ownedAdapterRun();
     try {
       const stopping = createHeartbeatRunControl(db, callbacks(db))
         .cancelActiveForAgentInternal(run.agentId, "Agent paused", "agent_paused");
       await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
       expect(await acknowledgePreDispatchStop(db, run.id)).toMatchObject({ acknowledged: true, userStop: false });
-      await db.update(heartbeatRuns).set({ status: "failed", finishedAt: new Date(), error: "Agent paused", errorCode: "agent_paused" })
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date(), error: "Agent paused", errorCode: "agent_paused" })
         .where(eq(heartbeatRuns.id, run.id));
       control.finish();
       await stopping;
-      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
-        .toMatchObject({ status: "failed", errorCode: "agent_paused" });
+      const [terminal] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      expect(terminal).toMatchObject({ status: "cancelled", errorCode: "agent_paused" });
+      // Wake release and stranded-work recovery only spare a paused agent's
+      // issue when the run reads as an intentional stop.
+      expect(isOperatorStoppedRunRow(terminal!)).toBe(true);
       expect(await agentExecutionStopBlocker(db, [run.agentId])).toBeNull();
     } finally {
       control.finish();

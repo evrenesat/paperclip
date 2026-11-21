@@ -720,18 +720,28 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
     expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
   });
 
-  it("keeps the pause owner's error and code on a pre-dispatch setup stop", async () => {
+  it("ends a pre-dispatch pause as cancelled so pause, release and budget resume see an intentional stop", async () => {
     const f = await fixture();
     // The Stop owner writes these before aborting the control.
     await db.update(heartbeatRuns).set({ error: "Agent paused", errorCode: "agent_paused" })
       .where(eq(heartbeatRuns.id, f.run.id));
     f.controller.abort(new Error("Agent paused"));
     await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
-    expect(await read(f.run.id)).toMatchObject({ status: "failed", error: "Agent paused",
+    expect(await read(f.run.id)).toMatchObject({ status: "cancelled", error: "Agent paused",
       errorCode: "agent_paused", resultJson: {
         executionCancellation: { state: "acknowledged", proof: "no_provider_dispatch" } } });
-    expect(f.deps.setRunStatusIfRunning.mock.calls[0]?.slice(0, 3)).toEqual([f.run.id, "failed",
+    expect(f.deps.setRunStatusIfRunning.mock.calls[0]?.slice(0, 3)).toEqual([f.run.id, "cancelled",
       expect.objectContaining({ error: "Agent paused", errorCode: "agent_paused" })]);
+  });
+
+  it("keeps a budget stop's own reason on a pre-dispatch cancellation", async () => {
+    const f = await fixture();
+    await db.update(heartbeatRuns).set({ error: "Cancelled due to budget pause", errorCode: "cancelled" })
+      .where(eq(heartbeatRuns.id, f.run.id));
+    f.controller.abort(new Error("Cancelled due to budget pause"));
+    await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
+    expect(await read(f.run.id)).toMatchObject({ status: "cancelled",
+      error: "Cancelled due to budget pause", errorCode: "cancelled" });
   });
 
   it("keeps a stop requested before the lease loss when the adapter throws", async () => {

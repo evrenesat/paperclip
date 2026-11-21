@@ -53,9 +53,9 @@ export function recordedUserStopRequestSql() {
 
 /** A Stop before provider dispatch has no provider to confirm it. Record the
  * acknowledgement while the run is still live so its terminal write can report
- * verified termination without claiming remote work was stopped. Report whether
- * the Stop carried user intent so only that path leaves the run for the Stop
- * owner; pause and budget stops still write their own failure status. */
+ * verified termination without claiming remote work was stopped. Report the
+ * Stop owner's own reason and code too, so the terminal `cancelled` write keeps
+ * them and pause, release and budget resume all see an intentional stop. */
 export async function acknowledgePreDispatchStop(db: Db, runId: string): Promise<{
   acknowledged: boolean; userStop: boolean; acknowledgedAt: string;
   error: string | null; errorCode: string | null;
