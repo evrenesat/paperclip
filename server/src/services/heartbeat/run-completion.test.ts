@@ -702,6 +702,18 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
         deadlineLateMs: 55_000, renewalCount: 3 } } });
   });
 
+  it("leaves a pre-dispatch Stop to the cancellation owner instead of recording a setup failure", async () => {
+    const f = await fixture();
+    const resultJson = { cleanup: { status: "pending_cleanup", evidence: "keep" } };
+    await db.update(heartbeatRuns).set({ resultJson }).where(eq(heartbeatRuns.id, f.run.id));
+    f.controller.abort(new Error("Stopped from the board"));
+    await f.completion.failRunSetup(f.setup(new Error("Run stopped before provider startup")));
+    expect(await read(f.run.id)).toMatchObject({ status: "running", error: null, errorCode: null, resultJson });
+    expect(f.deps.setRunStatusIfRunning).not.toHaveBeenCalled();
+    expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
+    expect(f.deps.finalizeAgentStatus).not.toHaveBeenCalled();
+  });
+
   it("keeps a stop requested before the lease loss when the adapter throws", async () => {
     const f = await fixture();
     const requested = requestedRunCancellation({ cancelledByActorType: "user", cancelledByUserId: "operator-1" }, "Stopped from the board");
