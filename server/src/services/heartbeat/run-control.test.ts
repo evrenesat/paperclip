@@ -1143,6 +1143,22 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     }
   });
 
+  it("finalizes a Stop when the setup owner settles without a terminal write", async () => {
+    const { run, control } = await ownedAdapterRun();
+    try {
+      const stopping = createHeartbeatRunControl(db, callbacks(db)).cancelRunInternal(run.id, "Operator Stop");
+      await vi.waitFor(() => expect(control.controller.signal.aborted).toBe(true));
+      control.finish();
+      const stopped = await stopping;
+      expect(stopped).toMatchObject({ status: "cancelled" });
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+        .toMatchObject({ status: "cancelled" });
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
   it("deduplicates agent batches and cancels only unclaimed pending wakes", async () => {
     const { company, agent } = await fixture();
     const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Other agent" }).returning();

@@ -1599,6 +1599,17 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
     // capture write), so only a stop before dispatch is a retryable lease loss.
     const controllerLeaseLost = !providerDispatchStarted &&
       signal.reason instanceof LegacyControllerLeaseLostError;
+    // A Stop that lands during setup aborts the control before any provider
+    // work starts. The Stop owner records the acknowledged cancellation; a
+    // `failed` write here would make that Stop report an unverifiable
+    // termination. Shutdown and lease loss settle through their own paths.
+    if (!providerDispatchStarted && !controllerLeaseLost && signal.aborted) {
+      logger.info(
+        { runId, errorKind: "setup_stopped_before_provider_start" },
+        "setup stopped before provider start; leaving cancellation settlement to the stop owner",
+      );
+      return;
+    }
     // Setup code before adapter.execute threw (e.g. ensureRuntimeState, resolveWorkspaceForRun).
     // The inner catch did not fire, so we must record the failure here.
     const providerFailure = providerFailureFromError(outerErr);
