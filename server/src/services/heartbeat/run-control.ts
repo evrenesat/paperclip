@@ -385,6 +385,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     agentId: string;
     status: string | null | undefined;
     failureReason?: string | null;
+    cancelActiveWork?: boolean;
     providerResourceDisposition?: ProviderResourceDisposition;
     respectCleanupDeadlines?: boolean;
     trigger?: string;
@@ -505,6 +506,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         agentId: input.agentId,
         status: leaseReleaseStatusForRunStatus(status),
         failureReason: input.failureReason ?? undefined,
+        ...(input.cancelActiveWork ? { cancelActiveWork: true } : {}),
         providerResourceDisposition,
         ...(input.respectCleanupDeadlines ? { respectCleanupDeadlines: true } : {}),
         nativeLifecycleTelemetry: input.nativeLifecycleTelemetry,
