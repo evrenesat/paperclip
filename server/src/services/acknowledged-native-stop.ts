@@ -51,6 +51,30 @@ export function recordedUserStopRequestSql() {
       or jsonb_typeof(${result}->'startupCancellation') = 'object'))`;
 }
 
+/** A user Stop before provider dispatch has no provider to confirm it. Record
+ * the acknowledgement while the run is still live so its terminal write can
+ * report verified termination without claiming remote work was stopped. */
+export async function acknowledgePreDispatchUserStop(db: Db, runId: string): Promise<boolean> {
+  const acknowledgedAt = new Date();
+  const [acknowledged] = await db.update(heartbeatRuns).set({
+    resultJson: sql`jsonb_set(
+      coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb),
+      '{executionCancellation}',
+      coalesce(${heartbeatRuns.resultJson}->'executionCancellation', '{}'::jsonb)
+        || ${JSON.stringify({
+          state: "acknowledged",
+          acknowledgedAt: acknowledgedAt.toISOString(),
+          proof: "no_provider_dispatch",
+        })}::jsonb,
+      true
+    )`,
+    updatedAt: acknowledgedAt,
+  }).where(and(
+    eq(heartbeatRuns.id, runId), eq(heartbeatRuns.status, "running"), recordedUserStopRequestSql(),
+  )).returning({ id: heartbeatRuns.id });
+  return Boolean(acknowledged);
+}
+
 export function hasAcknowledgedNativeLifecycleStopIntent(run: Parameters<typeof hasAcknowledgedNativeRunStopReceipt>[0]): boolean {
   return isAgentLifecycleStopRecord(run.resultJson) && hasAcknowledgedNativeRunStopReceipt(run);
 }
